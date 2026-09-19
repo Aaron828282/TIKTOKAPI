@@ -1,0 +1,15 @@
+# 构建上下文里不需要的东西
+.git
+.gitignore
+node_modules
+.env
+.env.*
+session*.json
+*local*.json
+certs
+reference
+__pycache__
+*.py
+*.pyc
+*.md
+!README.md

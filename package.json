@@ -1,0 +1,17 @@
+{
+  "name": "tiktok-exec-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "海外执行节点：替 api号池 执行 TikTok Creative Studio R2V 任务（无浏览器、零依赖）",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "selftest": "node lib/sigv4.js",
+    "preflight": "node preflight.js"
+  },
+  "dependencies": {},
+  "license": "UNLICENSED"
+}

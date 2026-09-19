@@ -1,0 +1,31 @@
+# 凭据与本地产物一律不进版本库。
+#
+# ⚠️ 这个仓库是 **Public** —— 一旦误提交 cookie / agent_token，
+#    等于把号池的派单权和 TikTok 登录态一起公开。
+#    下面的规则是兜底，不是许可：提交前仍然要 `git status` 扫一眼。
+
+node_modules/
+
+# 会话凭据（TikTok 登录态）
+.env
+.env.*
+!.env.example
+session.json
+session*.json
+*credentials*.json
+*local*.json
+
+# 私钥 / 证书
+certs/
+*.pem
+*.key
+!reference/**
+
+# 运行产物
+data/
+*.log
+logs/
+
+# Python 参考实现的缓存（reference/sigv4.py 本身要保留，它是移植的依据）
+__pycache__/
+*.pyc

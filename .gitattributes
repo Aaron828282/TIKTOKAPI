@@ -1,0 +1,9 @@
+# 这个节点跑在 Linux（Hostinger / Docker）上，统一 LF。
+# 不加这条的话，Windows 检出会把 LF 换成 CRLF，Dockerfile 与 shebang 都可能出问题。
+* text=auto eol=lf
+
+# 二进制明确标注，免得被当文本做行尾转换
+*.png binary
+*.jpg binary
+*.mp4 binary
+*.ico binary
