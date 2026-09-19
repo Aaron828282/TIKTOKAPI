@@ -107,7 +107,15 @@ function connectThrough({ host, port, proxy, timeout = 10000 }) {
 /** 经代理时把已连通的裸 socket 升成 TLS。 */
 function upgradeTls(sock, host, ca, insecure) {
   return new Promise((resolve, reject) => {
-    const opts = { socket: sock };
+    // ⚠️ `host` 这个字段**必须显式传**，哪怕连接已经由 sock 建立了。
+    //    原因：证书校验（`checkServerIdentity`）取的 hostname 是
+    //    `options.servername || options.host || 'localhost'`。
+    //    IP 字面量不允许发 SNI（RFC 6066），所以 servername 是空的，
+    //    于是校验回落到 `options.host` —— 不给就默认 `localhost`，
+    //    结果是**证书明明带 `IP Address:39.96.66.94` 也报
+    //    "Hostname/IP does not match certificate's altnames"**，
+    //    看起来像证书签错了，其实是探针自己没报名。
+    const opts = { socket: sock, host };
     // RFC 6066 不允许对 IP 字面量发 SNI；带上只会换来一条 DeprecationWarning
     if (!net.isIP(host)) opts.servername = host;
     if (ca) opts.ca = ca;
@@ -148,7 +156,13 @@ function makeAgent(isHttps, { proxy, ca, insecure, timeout }) {
           return;
         }
         const t = { socket: sock, timeout };
-        // IP 字面量不合法做 SNI，Node 只警告不报错；带 host 是为了域名场景
+        // ⚠️ 除了 SNI，还必须显式带 host：证书校验取的是
+        //    `servername || host || 'localhost'`。IP 字面量按 RFC 6066 不发 SNI，
+        //    servername 只能是空的 —— 不补 host，校验就会拿 `localhost`
+        //    去比一张写着 `IP Address:39.96.66.94` 的证书，报
+        //    "Hostname/IP does not match certificate's altnames"。
+        //    （注释原先就写「带 host 是为了域名场景」，但代码里根本没带 —— 已修。）
+        if (opts.host) t.host = opts.host;
         if (!net.isIP(opts.host)) t.servername = opts.host;
         if (ca) t.ca = ca;
         if (insecure) t.rejectUnauthorized = false;

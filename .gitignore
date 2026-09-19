@@ -16,7 +16,14 @@ session*.json
 *local*.json
 
 # 私钥 / 证书
-certs/
+#
+# ⚠️ 必须写 `certs/*` 而不是 `certs/`。
+#    Git 不允许「重新包含一个位于被排除目录下的文件」——
+#    写成目录形式后，下面的 `!certs/pool-ca.crt` 会被**静默忽略**，
+#    文件一直不进版本库，`git status` 里也看不出来（只显示 `!! certs/`）。
+#    `.dockerignore` 里的写法同理（用的是同一套忽略语义）。
+certs/*
+!certs/pool-ca.crt
 *.pem
 *.key
 !reference/**

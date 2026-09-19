@@ -6,7 +6,10 @@ node_modules
 .env.*
 session*.json
 *local*.json
-certs
+# ⚠️ 不能整目录排除 certs —— 只留号池自签证书（公钥，非机密），
+#    Dockerfile 要 COPY 它做身份钉死（RH_POOL_CA_FILE）。
+certs/*
+!certs/pool-ca.crt
 reference
 __pycache__
 *.py

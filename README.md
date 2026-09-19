@@ -52,15 +52,19 @@ node lib/sigv4.js
 
 # 2) 上线前置验收（机器体检 + 号池链路 + TikTok 链路）
 node preflight.js --token "$RH_AGENT_TOKEN"
-#    → 必检 13 项全过才算可以上
+#    → 必检项全过才算可以上
 
 # 3) 起服务
 RH_POOL_URL=https://39.96.66.94 \
 RH_AGENT_TOKEN=xxx \
-RH_POOL_INSECURE=1 \
+RH_POOL_CA_FILE=certs/pool-ca.crt \
 RH_SESSION_JSON="$(cat session.json | base64 -w0)" \
 node index.js
 ```
+
+> `certs/pool-ca.crt` 已经躺在仓库里，就是号池 443 那张 IP 自签证书（**纯公钥，不是私钥**），
+> 用它可以做身份钉死。**不要**图省事用 `RH_POOL_INSECURE=1` —— 那只加密、不验身份，
+> 等于给中间人留门。只有在这张证书本身被换掉、一时拿不到新的时才临时用它。
 
 ## 在 Hostinger 上部署
 
@@ -77,10 +81,12 @@ docker build -t tiktok-exec-node .
 docker run -d --name tiktok-node --restart unless-stopped -p 8080:8080 \
   -e RH_POOL_URL=https://39.96.66.94 \
   -e RH_AGENT_TOKEN=<号池侧同一个值> \
-  -e RH_POOL_INSECURE=1 \
   -e RH_SESSION_JSON="$(cat session.json | base64 -w0)" \
   tiktok-exec-node
 ```
+
+> 镜像里已经把 `certs/pool-ca.crt` COPY 进去，并把 `RH_POOL_CA_FILE` 默认指到
+> `/app/certs/pool-ca.crt` —— 所以 Docker 路径**不必**再传证书相关变量。
 
 ## 环境变量
 
@@ -91,7 +97,7 @@ docker run -d --name tiktok-node --restart unless-stopped -p 8080:8080 \
 | `RH_POOL_URL` | 号池地址。**用 IP 字面量** —— IP 不发 SNI，正好绕过阿里云对未备案域名的 SNI 拦截 |
 | `RH_AGENT_TOKEN` | 号池 `config.json` 里的 `agent_token`，**两边必须一致** |
 | `RH_SESSION_JSON` | TikTok 登录态 `{cookie, x_csrftoken, device_id}`，原样或 base64 |
-| `RH_POOL_CA_FILE` 或 `RH_POOL_INSECURE` | 号池 443 是 IP 自签证书，二选一 |
+| `RH_POOL_CA_FILE` 或 `RH_POOL_INSECURE` | 号池 443 是 IP 自签证书，二选一。仓库里已带 `certs/pool-ca.crt`；Docker 镜像里默认就是 `/app/certs/pool-ca.crt` |
 
 > ⚠️ `agent_token` 为空时号池会回 **503 `AGENT_DISABLED`** —— 它刻意 fail closed，
 > 不会退化成「谁都能拉活」。
