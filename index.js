@@ -227,7 +227,11 @@ async function executeTask(task) {
     }
     log('  下载成片并转存（mirror 模式）…');
     const bytes = await tiktok.download(result.bestUrl, cfg);
-    outputUrl = await mirror(bytes, `${result.taskId}.mp4`);
+    // ⚠️ 文件名必须用**号池任务号**（`task.task_id`），不是 `result.taskId`。
+    // `result.taskId` 是 TikTok 侧的任务号（也就是回报里的 remote_task_id），
+    // 号池把它对客户隐藏，网站拿不到、无法反查用户 —— 收件方按它落库会变成孤儿资产。
+    // 号池任务号 = 网站 generation_jobs.upstream_task_id，收件方可以据此确认归属。
+    outputUrl = await mirror(bytes, `${task.task_id}.mp4`, task.task_id);
     log(`  已转存 → ${outputUrl.slice(0, 100)}`);
   }
 
@@ -245,13 +249,20 @@ async function executeTask(task) {
   };
 }
 
-/** 把成片字节交给下游换一个稳定 URL。 */
-async function mirror(bytes, filename) {
+/**
+ * 把成片字节交给下游换一个稳定 URL。
+ *
+ * `taskId` 是**号池任务号**，同时放进 `X-Relay-Task-Id` 头 —— 文件名可能被
+ * 中间层改写，头更可靠。收件方应校验这个号确实是它自己下过单的任务，
+ * 再决定落点（别让上传方指定存储路径，否则等于把别人资产的开写权限交出去）。
+ */
+async function mirror(bytes, filename, taskId = '') {
   const res = await fetch(cfg.mirrorUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'video/mp4',
       'Content-Disposition': `attachment; filename="${filename}"`,
+      ...(taskId ? { 'X-Relay-Task-Id': String(taskId) } : {}),
       ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
     },
     body: bytes,
