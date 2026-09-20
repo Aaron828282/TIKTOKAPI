@@ -46,19 +46,22 @@ cookie + `x-creative-source` 直连就能建单、轮询、下载；
 零 npm 依赖 —— 不需要 `npm install`。
 
 ```bash
-# 1) 签名算法自证（不联网、不需要任何凭据）
-node lib/sigv4.js
-#    → 7/7 通过
+# 1) 全部离线自测（不联网、不需要任何凭据、零额度消耗）
+npm run selftest
+#    sigv4 7/7 · session 36 项 · offline 5 场景 23 项
 
-# 2) 离线集成自测（假号池 + 假上游，不联网、零额度消耗）
-node selftest/offline.js
-#    → 5 个场景 / 23 项断言，覆盖取消检测、mirror 标识、变体形状、体积闸门
+# 2) 拿会话凭据（TikTok 广告线登录态）—— 见下一节
+node tools/from-curl.js --in curl.txt
+#    → 写出 session.json，并打印要填进 RH_SESSION_JSON 的 base64
 
-# 3) 上线前置验收（机器体检 + 号池链路 + TikTok 链路 + 交付路径）
+# 3) 只验会话（换 cookie 后跑这个，秒出、不花额度）
+node preflight.js --session-only
+
+# 4) 上线前置验收（机器体检 + 号池链路 + TikTok 链路 + 会话 + 交付路径）
 node preflight.js --token "$RH_AGENT_TOKEN"
 #    → 必检项全过才算可以上
 
-# 4) 起服务
+# 5) 起服务
 RH_POOL_URL=https://39.96.66.94 \
 RH_AGENT_TOKEN=xxx \
 RH_POOL_CA_FILE=certs/pool-ca.crt \
@@ -75,6 +78,60 @@ node index.js
 > `certs/pool-ca.crt` 已经躺在仓库里，就是号池 443 那张 IP 自签证书（**纯公钥，不是私钥**），
 > 用它可以做身份钉死。**不要**图省事用 `RH_POOL_INSECURE=1` —— 那只加密、不验身份，
 > 等于给中间人留门。只有在这张证书本身被换掉、一时拿不到新的时才临时用它。
+
+## 拿会话凭据 —— `RH_SESSION_JSON` 从哪来
+
+它不是「一串 API key」，而是**一个已登录浏览器会话的完整快照**。
+唯一的来源是：**在一台已登录广告线 Creative Studio 的浏览器里抓一条真请求**。
+
+### 三步（别手抄）
+
+```bash
+# 1) 浏览器：登录 ads.tiktok.com → 打开 Creative Studio（图生视频那个页面）
+# 2) DevTools → Network → 筛 creative_bff_i18n
+#    → 点任意一条请求 → 右键 → Copy → **Copy as cURL (bash)**
+#    → 粘进 ./curl.txt（一行还是一堆 `\` 续行都行）
+# 3) 转换
+node tools/from-curl.js --in curl.txt
+#    → 写出 session.json（0600），并打印 RH_SESSION_JSON 要用的 base64
+```
+
+转换器会把下面这些一次性挑出来，不需要你手工对齐：
+
+| 字段 | 从哪取 | 必需 |
+|---|---|---|
+| `cookie` | `cookie:` 请求头原文（**含 httpOnly**） | ✅ |
+| `x_csrftoken` | `x-csrftoken` 头；没有就从 cookie 的 `csrftoken=` 补 | ✅ |
+| `device_id` | URL 里的 `device_id=` / `did=` 查询参数 | ✅ |
+| `x_fp_id` | `x-fp-id` 头（实测可省，有就带上） | — |
+| `user_agent` | `user-agent` 头（建议与真实浏览器版本一致） | — |
+
+### 🔴 为什么不能用 `document.cookie`
+
+`document.cookie` **读不到 httpOnly**，而身份层认的 `sessionid_ads` 正是 httpOnly。
+在 Console 里 `copy(document.cookie)` 会得到一份「看着很长、其实少了关键几项」的
+假凭据 —— 它不会当场报错，而是在**第一次出片**时才以 `10001106 Login Required`
+的形式炸出来，很容易被误判成「刚取的就过期了」。Copy as cURL 是 DevTools 从网络层
+导出的，**包含 httpOnly**，这才是真凭据。（`from-curl.js` 会替你检查 `sessionid_ads`
+在不在，缺了就报错退出。）
+
+### ⏰ 它是**耗材**：广告线 3 天，通用线 180 天
+
+| cookie | 声明 TTL | 属于 |
+|---|---|---|
+| `sid_guard` | `15551999` 秒 ≈ **180 天** | 通用登录态（号池**不认**） |
+| `sid_guard_ads` | `259200` 秒 = **3 天** | **广告线登录态（号池认这个）** |
+
+所以「多久换一次」不是策略问题，是硬约束：
+`from-curl.js` 会直接告诉你还剩几小时，节点的启动日志与 `/status` 的
+`session_lifetime` 也会报 —— **剩不足 12 小时就开始告警**，别等它变成 `10001106`。
+
+### 安全
+
+这份 cookie 等同**账号控制权**（含 `tt_ticket_guard_client_data` 里的 EC 私钥）。
+`curl.txt` / `session.json` 都已在 `.gitignore` 里，**别提交、别贴聊天记录**。
+换 cookie 的副作用是旧会话不一定立刻失效 —— 想彻底踢掉旧的，去后台「登出所有设备」。
+
 
 ## 在 Hostinger 上部署
 
@@ -134,11 +191,15 @@ docker run -d --name tiktok-node --restart unless-stopped -p 8080:8080 \
 
 ```
 index.js            入口：HTTP 服务 + 取活循环（含取消检测、交付、回报）
-preflight.js        上线前置验收（单文件可跑：配置 / 机器 / 号池 / TikTok / 交付）
+preflight.js        上线前置验收（配置 / 机器 / 号池 / TikTok / 会话 / 交付）
+                    --session-only 只跑会话那段（换 cookie 后秒验）
+tools/from-curl.js  「Copy as cURL」→ session.json + RH_SESSION_JSON 的 base64
 selftest/offline.js 离线集成自测：假号池 + 假上游，把 index.js 的编排真跑一遍
+selftest/session.js 会话层断言（cookie 解析 / 寿命推算 / 三档判定）
 selftest/boot.js    自测入口（把上游 I/O 换成假的，再加载真的 index.js）
 selftest/fake-*.js  假上游 / 假参考图上传
 lib/config.js       配置（全部来自环境变量）+ 配置自检
+lib/session.js      会话解析与寿命推算（纯函数，工具与运行时共用一份）
 lib/pool.js         号池 agent 通道客户端（严格对齐 agent_gateway.py）
 lib/payload.js      R2V 请求体构造
 lib/sigv4.js        AWS SigV4 签名器 + 官方向量自证
@@ -174,6 +235,25 @@ TikTok 的 `MainUrl` 有三个坑叠在一起，**「回报直链让下游自己
 - `RH_OUTPUT_MODE=cdn` 只为人工验证保留（比如手动看一眼片子）。切过去时 `/status`
   会带 `output_mode=cdn`，日志里也会打一行警告。
 
+### 收件端还没上线时，能验到哪一步
+
+分三档，可以逐档推进 —— **第一档不需要任何 TikTok 凭据**：
+
+| 阶段 | 需要配的东西 | 能证明什么 |
+|---|---|---|
+| ① 链路验收 | `RH_AGENT_TOKEN` + `RH_POOL_CA_FILE` | 节点进程活着、能 `claim`/`heartbeat`/`result`、号池看板里这台在线 |
+| ② 全链路验收 | 再加 `RH_SESSION_JSON`，并**临时** `RH_OUTPUT_MODE=cdn` | 参考图上传 → 建单 → 出片 → 回报，整条业务链路真的跑通 |
+| ③ 生产出片 | 再加 `RH_MIRROR_URL`（收件端上线后切回 `mirror`） | 成品落在自家存储上，下游归档不再撞那三道门 |
+
+② 阶段拿到的是 TikTok CDN 直链 —— 想人工看一眼片子，**必须带 `Referer`** 才下得动：
+
+```bash
+curl -H 'Referer: https://ads.tiktok.com/creative/creativestudio/image-to-video' \
+     -o out.mp4 '<回报回来的 MainUrl>'
+```
+
+验收完就把 `RH_OUTPUT_MODE` 切回 `mirror`（或者干脆删掉这个变量，默认就是 `mirror`）。
+
 ## 排障速查
 
 | 现象 | 真实原因 |
@@ -187,6 +267,9 @@ TikTok 的 `MainUrl` 有三个坑叠在一起，**「回报直链让下游自己
 | 控制台取消了任务，节点照跑到底 | `RH_PEEK_SECONDS=0` 关掉了取消检测（默认 20s 问一次） |
 | 看板上同一个 agent 忽上忽下 / 任务被别的执行体抢走 | 这台机器上还跑着**另一个** agent（旧的 Python `agent.py`）。同 hostname 会覆盖登记 —— 先把它停掉 |
 | `history` 回 `10001106` | 会话已死（广告线 TTL 只有 3 天），刷 cookie |
+| 刚取到的 cookie 就回 `10001106` | 多半是**用 `document.cookie` 取的** —— 漏了 httpOnly 的 `sessionid_ads`。改用 Copy as cURL，`tools/from-curl.js` 会替你检查这一项 |
+| `from-curl.js` 报「没找到 cookie 请求头」 | 点的是「Copy URL」而不是 **Copy as cURL (bash)** |
+| `/status` 的 `session_lifetime.level` 是 `warn` | 广告线会话剩不足 12 小时，该换 cookie 了（此时探活仍然通过） |
 | 提交回 `illegal url` | 参考图不在 ibyteimg 上；本节点会自动重传，若仍报错看上传日志 |
 | 下载 403 | **没带 `Referer`**，不是链接过期 |
 | 取到的片子分辨率偏低 | 别按索引取 `VideoInfos[0]`（那是最低档），要按 `max(W×H)` |
@@ -198,13 +281,19 @@ TikTok 的 `MainUrl` 有三个坑叠在一起，**「回报直链让下游自己
 **已离线验证**（不需要任何凭据、不消耗额度）
 
 - `lib/sigv4.js` — 7/7，含 **AWS 官方 ListUsers 向量**（不是自说自话的本地用例）
+- `selftest/session.js` — **36 项断言全过**：重复 cookie 键取末值、`x_fp_id`/`user_agent`
+  透传、`sid_guard_ads` 的编码/未编码两种形态、过期与「读不出」的处理、`describe()` 的三档
 - `selftest/offline.js` — **5 个场景 / 23 项断言全过**，钉住四类「不报错但结果不对」的坏法：
   取消检测没接上、mirror 用了错的任务号、`output_variants` 被压成字符串、体积闸门缺失
+- `tools/from-curl.js` — 对合成的 cURL 实跑：广告线样本解析出 8 个 cookie 键并算出
+  「还剩 2 天 22 小时」；通用线样本（缺 `sessionid_ads`）正确报错退出（码 2）
 - `lib/config.js` 的配置自检 — 逐案例验过 fail-closed（默认 mirror、缺收件端要点到、
   非法模式是致命、会话可选字段透传）
 - 全部文件 `node --check` 通过
 - `preflight.js` — 经海外出口实跑，必检项全过，并拿到真实业务码
-  （`history` → `code=10001106`、`upload-proxy` → 带 `ResponseMetadata` 的 400）
+  （`history` → `code=10001106`、`upload-proxy` → 带 `ResponseMetadata` 的 400）；
+  新增的 C2 段（会话）经 Clash 代理实跑，直连时正确报 `ETIMEDOUT`（DNS 污染），
+  走代理时拿到 `HTTP 401 code=10001106` —— 两条路径的判定都对
 
 **已在线验证（号池侧）**
 

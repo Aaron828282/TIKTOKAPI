@@ -3,11 +3,13 @@
 /**
  * 海外执行节点 —— 上线前置验收（preflight）。
  *
- * 在一台**即将承载执行节点**的机器上运行，一次性回答三个问题：
+ * 在一台**即将承载执行节点**的机器上运行，一次性回答几个问题：
  *
- *     A. 这台机器是不是干活的材料？  （Node 版本 / 落地国家 / 时钟 / 规格）
- *     B. 能不能连上号池？            （拉活通道：claim / heartbeat / result）
- *     C. 能不能连上 TikTok 上游？    （真正的业务链路：bff / upload-proxy / CDN）
+ *     A.  这台机器是不是干活的材料？  （Node 版本 / 落地国家 / 时钟 / 规格）
+ *     B.  能不能连上号池？            （拉活通道：claim / heartbeat / result）
+ *     C.  能不能连上 TikTok 上游？    （业务链路：bff / upload-proxy / CDN）
+ *     C2. TikTok 会话还有效吗？        （身份层，含「还剩多久」—— 广告线 TTL 只有 3 天）
+ *     D.  成品送得到收件端吗？        （交付路径）
  *
  * 设计约束
  * --------
@@ -20,6 +22,7 @@
  *     node preflight.js                                  # 生产：直连
  *     node preflight.js --proxy http://127.0.0.1:7890     # 借代理当海外视角
  *     node preflight.js --pool 39.96.66.94 --token XXX
+ *     node preflight.js --session-only                    # 只验会话（换 cookie 后跑这个）
  *
  * 退出码：0 = 必检项全过；1 = 有必检项失败。
  *
@@ -37,6 +40,9 @@ const fs = require('node:fs');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
+
+// 会话探活复用运行时那套实现（`postJson` 支持注入 fetch，好让它经代理发）
+const tiktok = require('./lib/tiktok');
 
 const TIKTOK_HOST = 'ads.tiktok.com';
 const HISTORY_PATH = '/creative_bff_i18n/api/cue/history/tasks';
@@ -475,6 +481,70 @@ async function partC(proxy) {
 }
 
 // ---------------------------------------------------------------------------
+// C2. TikTok 会话凭据 —— 身份层
+// ---------------------------------------------------------------------------
+/**
+ * 为什么单独一段：C 段能通只说明**网络**通，和「这份 cookie 还有效吗」是两件事。
+ * 广告线会话 TTL 只有 3 天，实测最常见的线上故障就是它悄悄过期，然后每个任务
+ * 都在上游收 `10001106 Login Required`，而节点日志里看着一切正常。
+ *
+ * 全程**不花额度**：只打 `history/tasks` 空体，看业务码。
+ */
+async function partC2(proxy) {
+  head('C2. TikTok 会话凭据 —— 身份层（探活不花额度）');
+
+  const { cfg, hasSession, loadSession, sessionStatus } = require('./lib/config');
+  const { parseCookies, remainingText } = require('./lib/session');
+
+  if (!hasSession()) {
+    let why = '';
+    try { loadSession(); } catch (err) { why = err.message; }
+    rec('会话凭据已配置', false, `${why} —— 节点能接单但无法执行，取法见 README「拿会话凭据」`);
+    return;
+  }
+
+  const sess = loadSession();
+  const cookies = parseCookies(sess.cookie);
+  const keys = Object.keys(cookies);
+
+  rec(`cookie 含 sessionid_ads（广告线身份）`, keys.includes('sessionid_ads'),
+    keys.includes('sessionid_ads')
+      ? `${keys.length} 个 cookie 键`
+      : `有 ${keys.length} 键但没有它 —— 多半取自通用线页面（tiktok.com），号池认的是广告线`,
+    keys.includes('sessionid_ads'));
+
+  // 寿命优先于探活：探活只说「现在还活着」，剩 2 小时它也一样报通过
+  const st = sessionStatus();
+  if (st && st.lifetime && st.lifetime.remain != null) {
+    rec(`广告线会话${remainingText(st.lifetime.remain)}`,
+      st.level !== 'dead',
+      st.level === 'dead' ? '已经过期，先重新登录再抓一份'
+        : (st.level === 'warn' ? '不足 12 小时，建议现在就换' : '正常'));
+  } else {
+    rec('广告线会话寿命', true, 'sid_guard_ads 读不出到期时间（不影响使用，按 3 天节奏换）', false);
+  }
+
+  // 探活：经代理发（本机直连 TikTok 会被 DNS 污染）
+  const viaProxy = async (url, init = {}) => {
+    const r = await request({
+      url, method: init.method || 'POST', headers: init.headers || {},
+      body: init.body || null, proxy, timeout: 30000,
+    });
+    return { status: r.status, text: async () => r.body };
+  };
+
+  try {
+    const probe = await tiktok.probeSession(sess, cfg, { fetchImpl: viaProxy });
+    const detail = `HTTP ${probe.status} code=${probe.code}` +
+      `${probe.message ? ' ' + String(probe.message).slice(0, 48) : ''}`;
+    rec('会话探活（POST history/tasks 空体）', probe.alive,
+      probe.alive ? `${detail} —— 会话有效` : `${detail} —— 会话已失效，重新取 cookie`);
+  } catch (err) {
+    rec('会话探活（POST history/tasks 空体）', false, err.message.slice(0, 90));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // D. 节点 -> 交付收件端
 // ---------------------------------------------------------------------------
 async function partD(proxy) {
@@ -556,7 +626,8 @@ function summary() {
 
 function parseArgs(argv) {
   const out = { pool: process.env.RH_POOL_HOST || '39.96.66.94', proxy: process.env.PREFLIGHT_PROXY || '',
-    token: process.env.RH_AGENT_TOKEN || '', ca: process.env.RH_POOL_CA_FILE || '', skipUpstream: false };
+    token: process.env.RH_AGENT_TOKEN || '', ca: process.env.RH_POOL_CA_FILE || '',
+    skipUpstream: false, sessionOnly: false };
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--pool') out.pool = argv[++i] || out.pool;
@@ -564,8 +635,10 @@ function parseArgs(argv) {
     else if (a === '--token') out.token = argv[++i] || '';
     else if (a === '--ca') out.ca = argv[++i] || '';
     else if (a === '--skip-upstream') out.skipUpstream = true;
+    else if (a === '--session-only') out.sessionOnly = true;
     else if (a === '--help' || a === '-h') {
-      console.log('用法: node preflight.js [--pool IP[:PORT]] [--token TOKEN] [--ca FILE] [--proxy URL] [--skip-upstream]');
+      console.log('用法: node preflight.js [--pool IP[:PORT]] [--token TOKEN] [--ca FILE]'
+        + ' [--proxy URL] [--skip-upstream] [--session-only]');
       process.exit(0);
     }
   }
@@ -587,9 +660,14 @@ async function main() {
   console.log('='.repeat(86));
 
   await partConfig();
+  if (args.sessionOnly) {
+    await partC2(args.proxy);
+    process.exit(summary());
+  }
   await partA(args.proxy);
   await partB(args.pool, args.proxy, args.token, args.ca);
   if (!args.skipUpstream) await partC(args.proxy);
+  await partC2(args.proxy);
   await partD(args.proxy);
   process.exit(summary());
 }

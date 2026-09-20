@@ -15,6 +15,11 @@ session*.json
 *credentials*.json
 *local*.json
 
+# 「Copy as cURL」的原始文本 —— 里面是**完整 cookie**，等同账号控制权
+curl*.txt
+*.curl
+curl.txt
+
 # 私钥 / 证书
 #
 # ⚠️ 必须写 `certs/*` 而不是 `certs/`。

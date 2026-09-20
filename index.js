@@ -39,7 +39,7 @@
  */
 const http = require('node:http');
 
-const { cfg, loadSession, hasSession, validate } = require('./lib/config');
+const { cfg, loadSession, hasSession, validate, sessionStatus } = require('./lib/config');
 const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, clampDuration } = require('./lib/payload');
 const { uploadImage } = require('./lib/upload');
@@ -73,6 +73,7 @@ const state = {
   poolOk: null,           // 最近一次号池自检结果
   presence: 'starting',
   session: null,          // { ok, code, message, at } —— 启动时那次会话探活
+  sessionLifetime: null,  // { level, note, remain } —— 广告线会话还剩多久
   skips: 0,               // peer 次数（观测用，确认取消检测真的在工作）
 };
 
@@ -115,6 +116,8 @@ const server = http.createServer((req, res) => {
       agent_token_set: Boolean(cfg.agentToken),
       session_ready: hasSession(),
       session_probe: state.session,
+      // 「还剩多久」—— 广告线 TTL 只有 3 天，这是唯一能提前预警的字段
+      session_lifetime: state.sessionLifetime,
       // 交付路径能不能用 —— 别等出片才发现收件端没配
       output_mode: cfg.outputMode,
       output_ready: cfg.outputMode !== 'mirror' || Boolean(cfg.mirrorUrl),
@@ -418,6 +421,15 @@ async function loop() {
     log('⚠️ 未提供会话凭据（RH_SESSION_JSON / RH_SESSION_FILE）—— ' +
       '节点能接单但无法执行。补齐后重启即可。', 'warn');
   } else {
+    // 先报「还剩多久」。广告线 TTL 只有 3 天，这个数字比「探活通过」更早预警 ——
+    // 探活只告诉你「现在还活着」，剩 2 小时它也这么说。
+    const st = sessionStatus();
+    if (st) {
+      state.sessionLifetime = { level: st.level, note: st.note, remain: st.lifetime && st.lifetime.remain };
+      const tag = st.level === 'dead' ? '🔴' : (st.level === 'warn' ? '⚠️' : '·');
+      log(`${tag} ${st.note}（cookie ${st.cookieKeys.length} 键）`,
+        st.level === 'ok' ? 'info' : (st.level === 'warn' ? 'warn' : 'error'));
+    }
     try {
       const probe = await tiktok.probeSession(loadSession(), cfg);
       state.session = { ok: probe.alive, code: probe.code, message: probe.message, at: Date.now() };

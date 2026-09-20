@@ -9,8 +9,11 @@
   },
   "scripts": {
     "start": "node index.js",
-    "selftest": "node lib/sigv4.js && node selftest/offline.js",
-    "preflight": "node preflight.js"
+    "preflight": "node preflight.js",
+    "selftest": "node lib/sigv4.js && node selftest/session.js && node selftest/offline.js",
+    "selftest:session": "node selftest/session.js",
+    "session:from-curl": "node tools/from-curl.js",
+    "session:check": "node preflight.js --session-only"
   },
   "dependencies": {},
   "license": "UNLICENSED"
