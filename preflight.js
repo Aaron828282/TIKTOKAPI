@@ -666,8 +666,12 @@ async function main() {
   }
   await partA(args.proxy);
   await partB(args.pool, args.proxy, args.token, args.ca);
-  if (!args.skipUpstream) await partC(args.proxy);
-  await partC2(args.proxy);
+  // C2 也是「打上游」的一枪，所以跟着 `--skip-upstream` 一起跳过 ——
+  // 否则在国内机上跑「跳过上游」的验收，照样会被 DNS 污染卡一条 FAIL 出来。
+  if (!args.skipUpstream) {
+    await partC(args.proxy);
+    await partC2(args.proxy);
+  }
   await partD(args.proxy);
   process.exit(summary());
 }
