@@ -53,6 +53,7 @@ const { buildPayload, clampDuration } = require('./lib/payload');
 const { uploadImage } = require('./lib/upload');
 const sessionruntime = require('./lib/sessionruntime');
 const tiktok = require('./lib/tiktok');
+const failure = require('./lib/failure');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const MIN_LEVEL = LEVELS[cfg.logLevel] || LEVELS.info;
@@ -316,6 +317,13 @@ async function executeTask(task) {
       },
     });
   } catch (err) {
+    // 🔴 无论哪种失败，先把**上游任务号**挂上再往外抛。
+    //    能走到这里说明建单已经成功、上游额度已经扣了 —— 失败路径上一旦丢掉
+    //    `remote_task_id`，事后既没法跟 TikTok 侧对账、也没法申诉。
+    //    改造前只有成功路径带它，失败任务在号池里是一片空白（连上游号都没有）。
+    if (err && !err.remoteTaskId && submitted && submitted.taskId) {
+      err.remoteTaskId = submitted.taskId;
+    }
     if (!sessionruntime.isAuthExpired(err)) throw err;
 
     // 🔴 轮询期间会话失效 —— **绝不重新提交**。
@@ -330,6 +338,10 @@ async function executeTask(task) {
     const e = new Error(`${err.message} —— 上游任务已建单，未重新提交（避免重复消耗）。`
       + '请到号池控制台换一份会话凭据，这条订单需要重新发起');
     e.cause = err;
+    // 把上游任务号与业务码**带过这一层**：新造的错误默认什么都不继承，
+    // 漏掉就等于把「上游已经建单」这个事实又丢了一次。
+    e.remoteTaskId = err.remoteTaskId;
+    e.upstreamCode = err.upstreamCode;
     throw e;
   }
 
@@ -574,11 +586,10 @@ async function loop() {
     try {
       outcome = await executeTask(task);
     } catch (err) {
-      outcome = {
-        ok: false,
-        cancelled: Boolean(err && err.cancelled),
-        error: `${err.name || 'Error'}: ${err.message}`.slice(0, 500),
-      };
+      // 失败也要**说清性质**：号池靠 error_kind 把「内容不合规」与
+      // 「会话过期」「节点掉线」分开 —— 三者处置方式完全不同，而改造前
+      // 在控制台上完全一样（都是 FAILED + 一段英文原文）。
+      outcome = failure.outcomeOf(err);
     }
 
     if (outcome.ok) {
@@ -590,13 +601,19 @@ async function loop() {
       log(`  ⏹ 已按调用方要求停止：${outcome.error}`, 'warn');
     } else {
       state.failed += 1;
-      log(`  ❌ 失败：${outcome.error}`, 'error');
+      const d = failure.describe(outcome.error_kind);
+      log(`  ❌ 失败[${d.label}${outcome.error_code ? ` ${outcome.error_code}` : ''}]：`
+        + `${outcome.error}`, 'error');
+      // 不可重发的失败要**显式说一句** —— 这是运营最容易踩的坑：
+      // 「重发一次试试」在这种场景下每次都真的烧掉一次上游额度。
+      if (outcome.retryable === false) log(`     ↳ ${d.advice}`, 'warn');
     }
 
     state.lastTask = {
       taskId: tid,
       ok: outcome.ok,
       detail: outcome.ok ? outcome.output_url.slice(0, 160) : outcome.error,
+      kind: outcome.error_kind || '',
       at: Date.now(),
     };
     await report(tid, outcome);

@@ -62,6 +62,19 @@ function ok(name, good, detail = '') {
   console.log(`  ${good ? '✓' : '✗'} ${name}${detail ? '  —— ' + detail : ''}`);
 }
 
+/**
+ * 断言失败时把**节点子进程的日志**一起打出来。
+ *
+ * 离线自测里节点是黑盒（子进程 + 假号池 + 假上游），失败时只看到「没有回报」
+ * 这类结论根本没法定位 —— 而真实原因几乎总在节点日志里（某一步抛了、
+ * 或压根没走到回报）。让失败自带证据，别让人再去改脚本打日志。
+ */
+function dumpLogIfFailed(good, log) {
+  if (good) return '';
+  return '\n--- 节点日志（失败时自动附带）---\n' + String(log || '(空)').trimEnd()
+    + '\n--- 日志结束 ---';
+}
+
 // ---------------------------------------------------------------------------
 // 假号池 —— 同时兼任 mirror 收件端
 // ---------------------------------------------------------------------------
@@ -113,10 +126,13 @@ function startFakePool(scenario) {
 // ---------------------------------------------------------------------------
 // 起一个真的 index.js 子进程，上游用假的
 // ---------------------------------------------------------------------------
-function startNode({ poolPort, childPort, mode, oversize, noMirrorUrl }) {
+function startNode({ poolPort, childPort, mode, oversize, noMirrorUrl, upstreamFail }) {
   const env = Object.assign({}, process.env, {
     RH_SELFTEST_RESULT: Buffer.from(JSON.stringify(FAKE_RESULT)).toString('base64'),
     RH_SELFTEST_OVERSIZE: oversize ? '1' : '',
+    // 让假上游在轮询阶段直接抛「上游终态拒绝」，用来验失败分类的回报契约。
+    RH_SELFTEST_UPSTREAM_FAIL: upstreamFail
+      ? Buffer.from(JSON.stringify(upstreamFail)).toString('base64') : '',
     RH_POOL_URL: `http://127.0.0.1:${poolPort}`,
     RH_AGENT_TOKEN: 'selftest-token',
     RH_AGENT_ID: 'selftest-node',
@@ -157,7 +173,14 @@ async function scenario(name, opts, check) {
   console.log(`\n■ ${name}`);
   const { server, seen, port } = await startFakePool(opts);
   const childPort = port + 1;
-  const node = startNode({ poolPort: port, childPort, mode: opts.mode, oversize: opts.oversize, noMirrorUrl: opts.noMirrorUrl });
+  const node = startNode({
+    poolPort: port,
+    childPort,
+    mode: opts.mode,
+    oversize: opts.oversize,
+    noMirrorUrl: opts.noMirrorUrl,
+    upstreamFail: opts.upstreamFail,
+  });
   try {
     const got = await waitFor(() => (seen.results.length ? seen.results[0] : null), 25000);
     await check({ seen, result: got, log: node.log() });
@@ -177,7 +200,8 @@ async function scenario(name, opts, check) {
   await scenario('场景 1 · mirror 模式下任务被取消', { mode: 'mirror', cancel: true }, ({ seen, result, log }) => {
     ok('节点领到了任务', seen.claims >= 1, `claim ${seen.claims} 次`);
     ok('轮询期间真的去问了「这活还要不要」', seen.peeks >= 1, `peek ${seen.peeks} 次`);
-    ok('停止后回报了失败（不覆盖调用方终态）', Boolean(result) && result.ok === false, result ? String(result.error).slice(0, 60) : '没有回报');
+    ok('停止后回报了失败（不覆盖调用方终态）', Boolean(result) && result.ok === false,
+      (result ? String(result.error).slice(0, 60) : '没有回报') + dumpLogIfFailed(Boolean(result), log));
     ok('取消时**没有**调用上游交付', seen.mirrors.length === 0, `mirror ${seen.mirrors.length} 次`);
     ok('日志里明确说了是取消', /取消/.test(log));
   });
@@ -244,6 +268,34 @@ async function scenario(name, opts, check) {
       String(result && result.archive_note).slice(0, 100));
     ok('仍然回报了上游任务号（可追溯）', Boolean(result && result.remote_task_id),
       String(result && result.remote_task_id));
+  });
+
+  // ---- 场景 6：上游以「内容不合规」拒绝 → 必须报出可区分的分类，且带上游任务号 ----
+  //
+  // 这是本次改造的核心验收。用户的原话是「**肯定是不能去一直重复测试、重复尝试
+  // 这条失败的任务**，因为本身用户上传的内容就不合规」。
+  // 系统里**本来就没有任何自动重试**（唯一的重试点在提交阶段的 10001106，
+  // 与内容无关），所以这一条要验的是另一件事：**让运营看得出「这条不该重发」**。
+  // 改造前三者在控制台上完全一样（都是 FAILED + 一段英文原文），谁也分不清。
+  await scenario('场景 6 · 上游内容不合规拒绝', {
+    mode: 'mirror',
+    upstreamFail: { code: 10043300, message: 'This content may violate our Community Guidelines. Try generating again.' },
+  }, ({ seen, result, log }) => {
+    ok('回报了失败', Boolean(result) && result.ok === false);
+    ok('分类为 CONTENT_MODERATION（控制台据此显示「内容不合规」）',
+      result && result.error_kind === 'CONTENT_MODERATION', String(result && result.error_kind));
+    ok('原样带回上游错误码', String(result && result.error_code) === '10043300',
+      String(result && result.error_code));
+    ok('标记 retryable=false（同素材重发必再失败且照扣额度）',
+      result && result.retryable === false, String(result && result.retryable));
+    ok('**失败也带上游任务号**（改造前这里是一片空白，无法对账/申诉）',
+      Boolean(result && result.remote_task_id), String(result && result.remote_task_id));
+    ok('error 保留上游原文（不是把中文结论落库）',
+      /Community Guidelines/.test(String(result && result.error)));
+    ok('输出里不含上游英文的"已成功"字段（确认走的是失败分支）',
+      !result.output_url);
+    ok('节点日志明确点出「不该重发」（防运营盲重发）',
+      /重发会被同样拒绝/.test(log), '');
   });
 
   console.log('\n' + '='.repeat(70));

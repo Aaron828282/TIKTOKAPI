@@ -28,8 +28,11 @@
                                     上传参考图 → 提交 → 轮询 → 下载
 ```
 
-号池侧的 agent 通道协议**一行都没改**（`server/app/agent_gateway.py` 原样复用），
-换的只是「谁在另一端执行」。
+号池侧的 agent 通道协议**只做加法**：`server/app/agent_gateway.py` 里 `result` 的
+回报字段多了 `error_kind` / `error_code` / `remote_task_id`（**都可选**，老节点不报也能用），
+其余原样复用，换的只是「谁在另一端执行」。
+`CONTENT_MODERATION` 在号池落成 `AUDIT_FAILED` —— 这个语义在 RunningHub 链路上
+早就存在（红色样式与统计口径都在），本次只是**让 agent 链路也用上它**。
 
 ## 为什么不用浏览器
 
@@ -48,7 +51,7 @@ cookie + `x-creative-source` 直连就能建单、轮询、下载；
 ```bash
 # 1) 全部离线自测（不联网、不需要任何凭据、零额度消耗）
 npm run selftest
-#    sigv4 7/7 · session 36 项 · offline 5 场景 23 项
+#    sigv4 7/7 · session 36 项 · failure 48 项 · offline 6 场景 40 项
 
 # 2) 拿会话凭据（TikTok 广告线登录态）—— 见下一节
 node tools/from-curl.js --in curl.txt
@@ -269,6 +272,8 @@ preflight.js        上线前置验收（配置 / 机器 / 号池 / TikTok / 会
                     --session-only 只跑会话那段（换 cookie 后秒验）
 tools/from-curl.js  「Copy as cURL」→ session.json + RH_SESSION_JSON 的 base64
 selftest/offline.js 离线集成自测：假号池 + 假上游，把 index.js 的编排真跑一遍
+selftest/failure.js 失败分类断言（含把真的 `tiktok.poll` 用假 fetch 跑起来，
+                    钉住「抛出的对象里到底有没有 upstreamCode」）
 selftest/session.js 会话层断言（cookie 解析 / 寿命推算 / 三档判定）
 selftest/sessionpool.js
                     会话凭据「号池持有 → 节点索取」的离线自测
@@ -284,6 +289,8 @@ lib/sessionruntime.js
                     会话运行时：向号池取 / 验活 / 回报 / 10001106 强刷重试
 lib/pool.js         号池 agent 通道客户端（严格对齐 agent_gateway.py）
 lib/payload.js      R2V 请求体构造
+lib/failure.js      失败分类器（**不做重试**，只回答「值不值得重发」）
+                    —— 唯一的策略出处：为什么内容不合规不能被重发
 lib/sigv4.js        AWS SigV4 签名器 + 官方向量自证
 lib/upload.js       参考图五步上传（STS → Apply → TOS → Commit → CDN URL）
 lib/tiktok.js       提交 / 轮询 / 下载 / 会话探活
@@ -336,6 +343,55 @@ curl -H 'Referer: https://ads.tiktok.com/creative/creativestudio/image-to-video'
 
 验收完就把 `RH_OUTPUT_MODE` 切回 `mirror`（或者干脆删掉这个变量，默认就是 `mirror`）。
 
+## 失败了怎么分类（`result` 契约）
+
+**改造前的坏样子**：所有失败在号池里都长成同一个 `FAILED` + 一段上游英文原文 ——
+
+```
+Error: 上游生成失败 [10043300] This content may violate our Community Guidelines.
+```
+
+于是三种**性质完全不同**的失败在控制台上无法区分，运营看到红色只知道「挂了」：
+
+| 真实原因 | 挑对动作才有用 | 同输入重发 |
+|---|---|---|
+| **内容不合规** | 换素材 / 改提示词 | ❌ 必然再失败，**且每次都照扣额度** |
+| **会话过期** | 到控制台换 cookie | ❌ 得**重新发起**这条任务 |
+| **节点心跳超时** | 重发 | ✅ 有意义 |
+
+改造后由 `lib/failure.js` 归类，`result` 回报里多三个字段（都**可选**，老节点不报
+时号池用 `.get()` 兜住，不会 500）：
+
+| 字段 | 含义 |
+|---|---|
+| `error_kind` | 8 类之一：`CONTENT_MODERATION` / `SESSION_EXPIRED` / `TIMEOUT` / `CANCELLED` / `QUOTA` / `PARAM` / `UPSTREAM_ERROR` / `UNKNOWN` |
+| `error_code` | 上游原始码，如 `10043300`；拿不到就空串 |
+| `retryable` | **派生结论**，刻意**不落库**（落库就要维护一致性，迟早漂） |
+
+| 类别 | 号池状态 | 重发 |
+|---|---|---|
+| `CONTENT_MODERATION` | **`AUDIT_FAILED`** | ❌ 同素材同提示词必再失败且照扣额度 |
+| `SESSION_EXPIRED` | `FAILED` | ❌ 换 cookie 后**重新发起** |
+| `TIMEOUT` | `FAILED` | ✅ 上游可能还在跑，等一会儿再发 |
+| `CANCELLED` | `FAILED` | — 不是故障 |
+| `QUOTA` | `FAILED` | ✅ 等 UTC 00:00 额度重置或加号 |
+| `PARAM` | `FAILED` | ❌ 换哪个号都一样 |
+| `UPSTREAM_ERROR` | `FAILED` | ✅ 稍后重发通常能过 |
+| `UNKNOWN` | `FAILED` | ⚠️ 先看原文，别盲重发 |
+
+设计取舍：
+
+- **`error` 只存上游技术原文，中文结论归展示层** —— 改文案不必回头动历史数据；
+  号池控制台按 `error_kind` 现算「内容不合规」+ 那句话。
+- **失败也带 `remote_task_id`** —— 改造前只有成功路径带 `submitted.taskId`，
+  失败任务在号池里无法跟上游对账 / 申诉。现在失败也回传。
+- **`Error: ` 前缀被剥掉** —— 那是 `${err.name || 'Error'}` 拼出来的噪音，纯占 500 字额度。
+- **`CONTENT_MODERATION` 必须当确定性终态**：API 文档写过「随机命中、重跑就过」，
+  **实测不成立**（同一张抽象几何图连跑两次都挂，换真实照片 + 改 prompt 一次就过）。
+- 🔴 **本模块不做任何重试**。全项目唯一重试点是 `sessionruntime.withSubmitRetry`
+  （只在**提交**阶段、只认 `10001106`、且号池那份凭据必须已换过）。**轮询阶段绝不重新提交**
+  —— 那时上游已经建单，重提 = 建第二单 = 白烧一次额度。
+
 ## 排障速查
 
 | 现象 | 真实原因 |
@@ -350,6 +406,9 @@ curl -H 'Referer: https://ads.tiktok.com/creative/creativestudio/image-to-video'
 | 控制台显示「已配置」但一直没验活结论 | 节点还没启动过、或够不到 `ads.tiktok.com`。**号池自己验不了这份 cookie**（DNS 被污染），结论只能由节点回报 |
 | 控制台显示「已失效」但你觉得 cookie 是新的 | 看 `verify_note` 里的错误码。`10001106` 才是真失效；其它文案（如超时）属于网络问题，别急着换 |
 | 提交时 `10001106`，日志说「重试一次」 | 会话过期；节点会向号池强刷一次再试。**只有提交阶段会重试** —— 轮询阶段重提会重复建单、白烧额度 |
+| 控制台显示「审核失败」/ 上游回 `10043300` | **内容不合规**（社区规范 / 版权 / 音频）。换素材或改提示词重发；**同输入重发必再失败且照扣额度** |
+| 日志里出现 `↳ advice` 那行 | 该类别**不该盲目重发**，那行就是在告诉你正确动作 |
+| 旧任务在控制台只有红色原文、没有中文分类 | 改造前的历史行（`error_kind` 为空）。**不会被新状态顶掉** —— 空就是空，别假装当初分过类 |
 | 交付环节失败「没配 RH_MIRROR_URL」 | 补上；**别指向号池的 `/api/v1/upload`**（那是图片口） |
 | 转存 413 / 「超过收件端上限」 | 收件端体积闸门；两边上限要一起抬 |
 | 控制台取消了任务，节点照跑到底 | `RH_PEEK_SECONDS=0` 关掉了取消检测（默认 20s 问一次） |
@@ -376,8 +435,15 @@ curl -H 'Referer: https://ads.tiktok.com/creative/creativestudio/image-to-video'
   `auto` 回落 env / `pool` 不回落 / `env` 完全不动号池、探活网络故障**不得**回报成失效、
   以及一条**结构守卫**（`withSubmitRetry` 只出现一次、且轮询的 catch 分支里没有重新提交）。
   B 段子进程起真 `index.js` 打假号池，验接线与 `/status` 观测面，并做凭据泄漏扫描
-- `selftest/offline.js` — **5 个场景 / 23 项断言全过**，钉住四类「不报错但结果不对」的坏法：
-  取消检测没接上、mirror 用了错的任务号、`output_variants` 被压成字符串、体积闸门缺失
+- `selftest/failure.js` — **48 项断言全过**。A 段把分类优先级逐条钉住（`cancelled` >
+  `SESSION_EXPIRED` > `CONTENT_MODERATION` > 本地超时 > …）、纯中文措辞也能归类、
+  同段号 `1004330*` 前缀都收、`Error: ` 前缀被剥掉、`error` 不以中文结论落库。
+  B 段用假 `fetchImpl` 把**真的 `tiktok.js poll()`** 跑起来，断言「真代码抛出的对象里
+  `upstreamCode` 确实存在」，并比对真代码与测试桩组装出的载荷**键集合完全一致**
+- `selftest/offline.js` — **6 个场景 / 40 项断言全过**，钉住五类「不报错但结果不对」的坏法：
+  取消检测没接上、mirror 用了错的任务号、`output_variants` 被压成字符串、体积闸门缺失、
+  以及**场景 6 上游内容不合规**：`error_kind=CONTENT_MODERATION`、`retryable=false`、
+  带回 `10043300`、**失败也带上游任务号**、日志明确点出「不该重发」
 - `tools/from-curl.js` — 对合成的 cURL 实跑：广告线样本解析出 8 个 cookie 键并算出
   「还剩 2 天 22 小时」；通用线样本（缺 `sessionid_ads`）正确报错退出（码 2）
 - `lib/config.js` 的配置自检 — 逐案例验过 fail-closed（默认 mirror、缺收件端要点到、
