@@ -51,7 +51,7 @@ cookie + `x-creative-source` 直连就能建单、轮询、下载；
 ```bash
 # 1) 全部离线自测（不联网、不需要任何凭据、零额度消耗）
 npm run selftest
-#    sigv4 7/7 · session 36 项 · failure 48 项 · offline 6 场景 40 项
+#    sigv4 7/7 · session 36 项 · failure 58 项 · offline 6 场景 40 项
 
 # 2) 拿会话凭据（TikTok 广告线登录态）—— 见下一节
 node tools/from-curl.js --in curl.txt
@@ -435,7 +435,7 @@ Error: 上游生成失败 [10043300] This content may violate our Community Guid
   `auto` 回落 env / `pool` 不回落 / `env` 完全不动号池、探活网络故障**不得**回报成失效、
   以及一条**结构守卫**（`withSubmitRetry` 只出现一次、且轮询的 catch 分支里没有重新提交）。
   B 段子进程起真 `index.js` 打假号池，验接线与 `/status` 观测面，并做凭据泄漏扫描
-- `selftest/failure.js` — **48 项断言全过**。A 段把分类优先级逐条钉住（`cancelled` >
+- `selftest/failure.js` — **58 项断言全过**。A 段把分类优先级逐条钉住（`cancelled` >
   `SESSION_EXPIRED` > `CONTENT_MODERATION` > 本地超时 > …）、纯中文措辞也能归类、
   同段号 `1004330*` 前缀都收、`Error: ` 前缀被剥掉、`error` 不以中文结论落库。
   B 段用假 `fetchImpl` 把**真的 `tiktok.js poll()`** 跑起来，断言「真代码抛出的对象里

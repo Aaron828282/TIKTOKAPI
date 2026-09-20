@@ -175,9 +175,13 @@ check('8 类样本都归到自己那一类，且 retryable 与真相源一致',
   drift.length === 0, drift.join(' / '));
 
 // 源码级：这两处提前 return 必须已经走 localFailure（别改回去）
+// 2026-09-21：「缺参考图」不再是错误（纯文生视频一等公民），钉住新行为——
+// 只拦「提示词与参考图同时为空」。
 const idxSrc = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
-check('「缺参考图」走 localFailure',
-  /if \(!images\.length\) \{\s*return failure\.localFailure/.test(idxSrc));
+check('「提示词与参考图全空」走 localFailure',
+  /if \(!prompt\.trim\(\) && !images\.length\) \{\s*return failure\.localFailure/.test(idxSrc));
+check('不再硬性要求参考图（旧 !images.length 拦截已删）',
+  !/if \(!images\.length\) \{\s*return failure\.localFailure/.test(idxSrc));
 check('「缺 agent.model_id」走 localFailure',
   /if \(!modelId\) \{[\s\S]{0,400}?return failure\.localFailure/.test(idxSrc));
 

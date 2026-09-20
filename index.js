@@ -239,12 +239,14 @@ async function executeTask(task) {
   const images = (task.image_urls || []).filter(Boolean);
   const duration = clampDuration(task.duration);
 
-  log(`  模型 ${task.model_name || spec.model_key}（${modelId}）· ${duration}s · ${images.length} 张参考图`);
+  log(`  模型 ${task.model_name || spec.model_key}（${modelId}）· ${duration}s · `
+    + (images.length ? `${images.length} 张参考图` : '无参考图（纯文生视频）'));
 
-  if (!images.length) {
+  // 参考图可空（纯文生视频，2026-09-21 用户需求 + payload.js 协议注释：上游接受空
+  // images 数组）；prompt 与参考图**不能同时为空**，否则上游无从生成。
+  if (!prompt.trim() && !images.length) {
     return failure.localFailure(failure.KIND.PARAM,
-      '外部后端需要参考图，且必须是节点能取到的公网地址：请用控制台的「参考图」'
-      + '上传本地图片（会先托管到公网），或直接填一个公网可访问的图片地址');
+      '提示词与参考图不能同时为空：至少填写提示词，或上传参考图');
   }
 
   // ---- 参考图 + 提交 ----
