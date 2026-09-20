@@ -79,7 +79,7 @@ function dumpLogIfFailed(good, log) {
 // 假号池 —— 同时兼任 mirror 收件端
 // ---------------------------------------------------------------------------
 function startFakePool(scenario) {
-  const seen = { claims: 0, heartbeats: [], peeks: 0, results: [], mirrors: [] };
+  const seen = { claims: 0, heartbeats: [], peeks: 0, results: [], mirrors: [], leases: [], releases: [] };
   const server = http.createServer((req, res) => {
     const p = (req.url || '').split('?')[0];
     const chunks = [];
@@ -96,6 +96,28 @@ function startFakePool(scenario) {
         seen.claims += 1;
         // 只给一次活，之后空转 —— 免得自测里反复领到同一个任务
         return send(200, seen.claims === 1 ? { task: TASK } : { task: null });
+      }
+      if (p === '/api/v1/agent/session/lease') {
+        const b = JSON.parse(body.toString() || '{}');
+        seen.leases.push(b);
+        if (scenario.noAccounts) {
+          // 池子里一个号都没有 → 节点必须回落 legacy 全局会话，而不是干等
+          return send(200, { ok: false, reason: 'no_account', backend: 'tiktok_r2v', pool: { total: 0, active: 0 } });
+        }
+        if (scenario.leaseBusyFirst && seen.leases.length === 1) {
+          // 第一次全忙（ok:false 不是错误）→ 节点应稍后重试而不是判失败
+          return send(200, { ok: false, reason: 'no_account', backend: 'tiktok_r2v', pool: { total: 1, active: 1, slots_used: 5, slots_total: 5 } });
+        }
+        return send(200, {
+          ok: true, backend: 'tiktok_r2v', task_id: b.task_id,
+          account: { id: 7, label: 'selftest-acct', max_slots: 5, running: 1, expires_ts: 0 },
+          session: { cookie: 'c', x_csrftoken: 'x', device_id: 'd' },
+          pool: { total: 1, active: 1, slots_used: 1, slots_total: 5 },
+        });
+      }
+      if (p === '/api/v1/agent/session/release') {
+        seen.releases.push(JSON.parse(body.toString() || '{}'));
+        return send(200, { ok: true, task_id: TASK.task_id, released: true });
       }
       if (p === '/api/v1/agent/heartbeat') {
         seen.heartbeats.push(JSON.parse(body.toString() || '{}'));
@@ -296,6 +318,29 @@ async function scenario(name, opts, check) {
       !result.output_url);
     ok('节点日志明确点出「不该重发」（防运营盲重发）',
       /重发会被同样拒绝/.test(log), '');
+  });
+
+  // ---- 场景 7：账号全忙 → ok:false 不是错误，重试后租到并正常出片 ----
+  await scenario('场景 7 · 账号全忙后租到并出片', { mode: 'mirror', leaseBusyFirst: true }, ({ seen, result, log }) => {
+    ok('第一次租号拿到 ok:false（不是错误）', seen.leases.length >= 2, `lease ${seen.leases.length} 次`);
+    ok('没有把「全忙」误判成任务失败', Boolean(result) && result.ok === true,
+      (result ? '成功' : '没有回报') + dumpLogIfFailed(Boolean(result), log));
+    ok('租约带了任务号（幂等键）',
+      seen.leases.every((l) => l.task_id === TASK.task_id), JSON.stringify(seen.leases[0] || {}));
+    ok('出片后归还了槽位', seen.releases.length === 1
+      && seen.releases[0].task_id === TASK.task_id
+      && seen.releases[0].account_id === 7, JSON.stringify(seen.releases[0] || {}));
+    ok('日志里点了「全忙后重试」', /租不到|全忙|再试/.test(log));
+  });
+
+  // ---- 场景 8：账号池为空 → 回落 legacy 全局会话（不占槽位、无 release） ----
+  await scenario('场景 8 · 账号池为空回落 legacy', { mode: 'mirror', noAccounts: true }, ({ seen, result, log }) => {
+    ok('确实去租过号', seen.leases.length >= 1, `lease ${seen.leases.length} 次`);
+    ok('任务照常成功（legacy 会话兜底）', Boolean(result) && result.ok === true,
+      (result ? '成功' : '没有回报') + dumpLogIfFailed(Boolean(result), log));
+    ok('legacy 路径不还槽（没有租约就没有 release）', seen.releases.length === 0,
+      `release ${seen.releases.length} 次`);
+    ok('日志里说了回落', /账号池为空|legacy/.test(log));
   });
 
   console.log('\n' + '='.repeat(70));

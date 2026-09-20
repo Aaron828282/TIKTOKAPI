@@ -51,7 +51,7 @@ cookie + `x-creative-source` 直连就能建单、轮询、下载；
 ```bash
 # 1) 全部离线自测（不联网、不需要任何凭据、零额度消耗）
 npm run selftest
-#    sigv4 7/7 · session 36 项 · failure 58 项 · offline 6 场景 40 项
+#    sigv4 7/7 · session 36 项 · failure 58 项 · offline 8 场景 49 项
 
 # 2) 拿会话凭据（TikTok 广告线登录态）—— 见下一节
 node tools/from-curl.js --in curl.txt
@@ -250,6 +250,7 @@ docker run -d --name tiktok-node --restart unless-stopped -p 8080:8080 \
 | `RH_SESSION_SOURCE` | 凭据来源：`auto`（默认，号池优先 + env 兜底）/ `pool`（只认号池）/ `env`（老行为） |
 | `RH_SESSION_REFRESH_SECONDS` | 多久问一次号池「凭据变了没」，默认 `600` |
 | `RH_SESSION_PROBE_SECONDS` | 验活间隔，默认 `21600`（6h）。**拉到新凭据时立刻验活**，不等定时 |
+| `RH_MAX_CONCURRENT` | 并发 worker 数 = 同时执行的任务数上限，默认 `5`（= TikTok 单账号并发上限）。多账号时设为 **账号数 × 5** 吃满池子 |
 
 **可选**（`RH_SESSION_SOURCE=env`，或号池还没配时的兜底）：
 
@@ -440,7 +441,7 @@ Error: 上游生成失败 [10043300] This content may violate our Community Guid
   同段号 `1004330*` 前缀都收、`Error: ` 前缀被剥掉、`error` 不以中文结论落库。
   B 段用假 `fetchImpl` 把**真的 `tiktok.js poll()`** 跑起来，断言「真代码抛出的对象里
   `upstreamCode` 确实存在」，并比对真代码与测试桩组装出的载荷**键集合完全一致**
-- `selftest/offline.js` — **6 个场景 / 40 项断言全过**，钉住五类「不报错但结果不对」的坏法：
+- `selftest/offline.js` — **8 个场景 / 49 项断言全过**，钉住五类「不报错但结果不对」的坏法：
   取消检测没接上、mirror 用了错的任务号、`output_variants` 被压成字符串、体积闸门缺失、
   以及**场景 6 上游内容不合规**：`error_kind=CONTENT_MODERATION`、`retryable=false`、
   带回 `10043300`、**失败也带上游任务号**、日志明确点出「不该重发」

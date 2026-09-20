@@ -48,6 +48,7 @@
 const http = require('node:http');
 
 const { cfg, loadSession, hasSession, validate, sessionStatus, sessionOrigin } = require('./lib/config');
+const { normalizeSession } = require('./lib/session');
 const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, clampDuration } = require('./lib/payload');
 const { uploadImage } = require('./lib/upload');
@@ -77,7 +78,7 @@ const state = {
   done: 0,
   failed: 0,
   cancelled: 0,           // 被调用方取消（靠 peek 发现）
-  current: null,          // { taskId, phase, progress, startedAt }
+  active: new Map(),      // taskId → { taskId, phase, progress, startedAt, worker, account }
   lastTask: null,         // { taskId, ok, detail, at }
   lastError: null,
   poolOk: null,           // 最近一次号池自检结果
@@ -161,11 +162,17 @@ const server = http.createServer((req, res) => {
       peek_seconds: cfg.peekSeconds,
       pool_ca_set: Boolean(cfg.poolCaFile) || Boolean(cfg.poolInsecure),
       presence: state.presence,
+      // 并发观测（lease 版）：running = 正在执行的任务数，active = 每条的明细
+      mode: 'lease',
+      concurrency: cfg.maxConcurrent,
+      running: state.active.size,
+      active: [...state.active.values()],
+      // 兼容旧观测口：取第一条在跑的
+      current: state.active.size ? [...state.active.values()][0] : null,
       claims: state.claims,
       done: state.done,
       failed: state.failed,
       cancelled: state.cancelled,
-      current: state.current,
       last_task: state.lastTask,
       last_error: state.lastError,
     });
@@ -189,42 +196,40 @@ const server = http.createServer((req, res) => {
 //
 // 号池侧 agent_timeout 默认 900s，30 秒一次足够。但**状态变化必须立刻上报**
 // —— 卡在 SUBMITTING 半小时不动的任务，在看板上看不出是在跑还是挂了。
+// lease 版并发执行：心跳状态是**每任务一份**（hb 闭包在 beater 里），
+// 状态变化同步写进 state.active 里那条的 phase/progress。
 // ---------------------------------------------------------------------------
-let hb = { last: 0, fails: 0, tid: '', status: '' };
+function makeBeater(taskId, active) {
+  const hb = { last: 0, fails: 0, status: '' };
+  return async function beat(status = null, progress = null) {
+    const now = Date.now();
+    const forced = Boolean(status) && status !== hb.status;
+    if (!forced && now - hb.last < cfg.heartbeatSeconds * 1000) return;
+    hb.last = now;
 
-async function beat(status = null, progress = null) {
-  const now = Date.now();
-  const forced = Boolean(status) && status !== hb.status;
-  if (!forced && now - hb.last < cfg.heartbeatSeconds * 1000) return;
-  hb.last = now;
+    if (status) {
+      hb.status = status;
+      active.phase = status;
+    }
+    if (progress !== null && progress !== undefined) active.progress = progress;
 
-  const body = { task_id: hb.tid, agent_id: cfg.agentId };
-  if (status) {
-    body.status = status;
-    hb.status = status;
-    state.current = { ...(state.current || {}), phase: status };
-  }
-  if (progress !== null && progress !== undefined) {
-    body.progress = progress;
-    state.current = { ...(state.current || {}), progress };
-  }
-
-  try {
-    await client.heartbeat(hb.tid, { status, progress, agentId: cfg.agentId });
-    hb.fails = 0;
-  } catch (err) {
-    hb.fails += 1;
-    // 心跳连续失败不立刻放弃任务：号池可能只是在重启。
-    // 真掉太久它自己会按 agent_timeout 判失败，我们照常把活干完再回报。
-    if (hb.fails === 3) log(`心跳连续失败，号池可能不可达；继续跑完并尝试回报`, 'warn');
-    if (cfg.logLevel === 'debug') log(`  心跳失败：${err.message}`, 'debug');
-  }
+    try {
+      await client.heartbeat(taskId, { status, progress, agentId: cfg.agentId });
+      hb.fails = 0;
+    } catch (err) {
+      hb.fails += 1;
+      // 心跳连续失败不立刻放弃任务：号池可能只是在重启。
+      // 真掉太久它自己会按 agent_timeout 判失败，我们照常把活干完再回报。
+      if (hb.fails === 3) log(`心跳连续失败，号池可能不可达；继续跑完并尝试回报`, 'warn');
+      if (cfg.logLevel === 'debug') log(`  心跳失败：${err.message}`, 'debug');
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
 // 单个任务的执行
 // ---------------------------------------------------------------------------
-async function executeTask(task) {
+async function executeTask(task, session, beat, { lease = false } = {}) {
   const spec = task.agent || {};
   const modelId = String(spec.model_id || '');
   if (!modelId) {
@@ -255,25 +260,30 @@ async function executeTask(task) {
   // 强刷凭据后重来一次 —— 因为此时上游还没有建单，重试不会造成第二次消耗。
   // 轮询阶段（下面）绝不重试，理由见那里。
   const uploadAndSubmit = async () => {
-    // ⚠️ 每次进来都**重新读一遍**凭据。重试路径上号池可能刚换过一份，
-    //    用闭包里捕获的旧 session 会让「重试」变成原样再撞一次墙。
-    const session = loadSession(backend);
+    // legacy 模式：每次**重新读一遍**全局会话缓存 —— 10001106 强刷后 withSubmitRetry
+    //    的重试路径必须拿到新凭据，用闭包里捕获的旧 session 会让「重试」变成原样再撞一次墙。
+    // lease 模式：会话随租约绑定账号（task.session），重读全局缓存反而会拿到**别的号**。
+    const sess = lease ? session : loadSession(backend);
 
     await beat('UPLOADING', 2);
     const resolved = [];
     for (let i = 0; i < images.length; i += 1) {
       log(`  参考图 ${i + 1}/${images.length}`);
-      resolved.push(await uploadImage(session, cfg, images[i], log));
+      resolved.push(await uploadImage(sess, cfg, images[i], log));
     }
 
     const payload = buildPayload(prompt, resolved, modelId, duration);
     await beat('SUBMITTING', 5);
     log(`  提交中（body ${Buffer.byteLength(JSON.stringify(payload))} 字节）…`);
-    return { submitted: await tiktok.submit(session, cfg, payload, log), session };
+    return { submitted: await tiktok.submit(sess, cfg, payload, log), session: sess };
   };
 
-  const { submitted, session } = await sessionruntime.withSubmitRetry(
-    uploadAndSubmit, { client, log, backend });
+  // legacy：唯一允许的会话失效重试点（强刷全局凭据后重试一次，此时上游未建单，安全）。
+  // lease：会话绑定账号，全局强刷毫无意义 —— 失效直接往外抛，由 runTask 做换号重试。
+  const submitOutcome = lease
+    ? await uploadAndSubmit()
+    : await sessionruntime.withSubmitRetry(uploadAndSubmit, { client, log, backend });
+  const { submitted, session: pollSession } = submitOutcome;
 
   // ---- 轮询 ----
   await beat('AGENT_RUNNING', 8);
@@ -294,7 +304,7 @@ async function executeTask(task) {
 
   let result;
   try {
-    result = await tiktok.poll(session, cfg, submitted.taskId, {
+    result = await tiktok.poll(pollSession, cfg, submitted.taskId, {
       timeoutMs: cfg.jobTimeoutSeconds * 1000,
       intervalMs: 8000,
       log,
@@ -333,13 +343,18 @@ async function executeTask(task) {
     // 上游的生成任务此刻已经建好了（钱已经花了），重提等于建第二单：
     // 白烧一次额度，而号池那边因为已有终态会把第二次结果直接丢掉 ——
     // 花了钱、连个报错都看不见。这与「Dify 提交节点不许开自动重试」同源。
-    log('轮询期间会话失效 —— 向号池刷新凭据并回报状态；'
+    // lease 模式没有「全局强刷」可做（会话绑定账号，cookie 死了只能换号或换 cookie）。
+    log('轮询期间会话失效 —— '
+      + (lease ? '该账号的 cookie 已失效' : '向号池刷新凭据并回报状态') + '；'
       + '**不重新提交**（上游任务已建单，重提只会造成第二次消耗）', 'warn');
-    await sessionruntime.refresh(client, log, {
-      force: true, reason: 'poll-10001106', probe: true, backend,
-    });
+    if (!lease) {
+      await sessionruntime.refresh(client, log, {
+        force: true, reason: 'poll-10001106', probe: true, backend,
+      });
+    }
     const e = new Error(`${err.message} —— 上游任务已建单，未重新提交（避免重复消耗）。`
-      + '请到号池控制台换一份会话凭据，这条订单需要重新发起');
+      + (lease ? '请到号池控制台给对应账号更换 cookie' : '请到号池控制台换一份会话凭据')
+      + '，这条订单需要重新发起');
     e.cause = err;
     // 把上游任务号与业务码**带过这一层**：新造的错误默认什么都不继承，
     // 漏掉就等于把「上游已经建单」这个事实又丢了一次。
@@ -559,6 +574,23 @@ async function loop() {
     + `每 ${cfg.sessionRefreshSeconds}s 向号池问一次变更 · 每 `
     + `${Math.round(cfg.sessionProbeSeconds / 3600)}h 验活一次`);
 
+  // ---- 并发取活 ----
+  //
+  // lease 版：maxConcurrent 个 worker 各自「claim → 租号 → 执行 → 还槽 → 回报」。
+  // 每个任务在 lease 那一刻绑定一个账号（占一个槽位），同一账号最多
+  // max_slots 个任务同时跑 —— 号池控制台的「账号槽位」「并发槽位」两块
+  // 显示的就是这套租约的实时状态。
+  log(`并发 worker × ${cfg.maxConcurrent}（RH_MAX_CONCURRENT 可调；`
+    + `单账号并发上限 5，多账号时建议设为 账号数 × 5）`);
+  const workers = [];
+  for (let i = 1; i <= cfg.maxConcurrent; i += 1) {
+    workers.push(workerLoop(i));
+  }
+  await Promise.all(workers);
+}
+
+/** 单个 worker：空闲时轮询 claim，领到就交给 runTask 串完整条生命周期。 */
+async function workerLoop(workerId) {
   while (!stopping) {
     let task = null;
     try {
@@ -566,7 +598,7 @@ async function loop() {
       task = got && got.task;
     } catch (err) {
       state.lastError = err.message;
-      log(`领取任务失败：${err.message}`, 'warn');
+      log(`[${workerId}] 领取任务失败：${err.message}`, 'warn');
       await tiktok.sleep(cfg.pollSeconds * 1000);
       continue;
     }
@@ -576,53 +608,181 @@ async function loop() {
       continue;
     }
 
-    const tid = task.task_id;
-    state.claims += 1;
-    state.presence = 'busy';
-    state.current = { taskId: tid, phase: 'claimed', progress: 0, startedAt: Date.now() };
-    hb = { last: 0, fails: 0, tid, status: '' };
-
-    log(`领到任务 ${tid} · ${task.model_name} · ${task.duration}s · ` +
-      `prompt=${String(task.prompt || '').slice(0, 40)}…`);
-
-    let outcome;
-    try {
-      outcome = await executeTask(task);
-    } catch (err) {
-      // 失败也要**说清性质**：号池靠 error_kind 把「内容不合规」与
-      // 「会话过期」「节点掉线」分开 —— 三者处置方式完全不同，而改造前
-      // 在控制台上完全一样（都是 FAILED + 一段英文原文）。
-      outcome = failure.outcomeOf(err);
-    }
-
-    if (outcome.ok) {
-      state.done += 1;
-      log(`  ✅ ${outcome.output_url.slice(0, 110)}`);
-    } else if (outcome.cancelled) {
-      // 取消不是故障：调用方已经自己把任务标成终态，号池会回 already_final。
-      state.cancelled += 1;
-      log(`  ⏹ 已按调用方要求停止：${outcome.error}`, 'warn');
-    } else {
-      state.failed += 1;
-      const d = failure.describe(outcome.error_kind);
-      log(`  ❌ 失败[${d.label}${outcome.error_code ? ` ${outcome.error_code}` : ''}]：`
-        + `${outcome.error}`, 'error');
-      // 不可重发的失败要**显式说一句** —— 这是运营最容易踩的坑：
-      // 「重发一次试试」在这种场景下每次都真的烧掉一次上游额度。
-      if (outcome.retryable === false) log(`     ↳ ${d.advice}`, 'warn');
-    }
-
-    state.lastTask = {
-      taskId: tid,
-      ok: outcome.ok,
-      detail: outcome.ok ? outcome.output_url.slice(0, 160) : outcome.error,
-      kind: outcome.error_kind || '',
-      at: Date.now(),
-    };
-    await report(tid, outcome);
-    state.current = null;
-    state.presence = 'idle';
+    await runTask(task, workerId);
   }
+}
+
+/**
+ * 执行单个任务的完整生命周期：租号 → 执行 → 还槽 → 回报。
+ *
+ * 租号语义（对齐 agent_gateway.py 的 /session/lease）：
+ *   · ok:false = 池子空或全忙，**不是错误** —— 等一会儿再试，任务不能判失败；
+ *   · 池子里一个号都没有（pool.total === 0）→ 回落 legacy 全局会话模式，
+ *     与旧版节点行为一致（单凭据 + withSubmitRetry）；
+ *   · 提交阶段命中 10001106 且上游未建单 → 标记该账号失效、还槽、
+ *     **换号重试一次**（exclude 排除刚失败的号）。
+ */
+async function runTask(task, workerId) {
+  const tid = task.task_id;
+  const backend = task.backend || cfg.sessionBackend;
+  state.claims += 1;
+
+  const active = {
+    taskId: tid, phase: 'claimed', progress: 0,
+    startedAt: Date.now(), worker: workerId, account: '',
+  };
+  state.active.set(tid, active);
+  state.presence = 'busy';
+  const beat = makeBeater(tid, active);
+
+  log(`[${workerId}] 领到任务 ${tid} · ${task.model_name} · ${task.duration}s · `
+    + `prompt=${String(task.prompt || '').slice(0, 40)}…`);
+
+  // ---- 租一个账号（占槽位）。幂等：同 task 再租返回原账号。 ----
+  const LEASE_WAIT_MS = 15 * 60 * 1000;   // 全忙时的最长等待；超时按执行失败处理
+  let account = null;                      // { id, label }
+  let session = null;                      // 租约带来的账号会话
+  let lease = false;
+  {
+    const deadline = Date.now() + LEASE_WAIT_MS;
+    while (!stopping) {
+      let r = null;
+      try {
+        r = await client.leaseSession({ backend, taskId: tid });
+      } catch (err) {
+        // 404 = 号池镜像还是旧版（没有 lease 端点）→ 与「池子为空」同路：
+        // 回落 legacy 全局会话。其余错误（网络抖动/5xx）与 claim 同策略，等一轮再试。
+        if (err && err.status === 404) {
+          log(`[${workerId}] 号池没有 /session/lease 端点（旧版镜像）—— `
+            + `回落全局会话（legacy 模式）执行任务 ${tid}`, 'warn');
+          break;
+        }
+        log(`[${workerId}] 租号请求失败：${err.message}`, 'warn');
+      }
+      if (r && r.ok && r.session) {
+        try {
+          session = normalizeSession(r.session);
+        } catch (err) {
+          log(`[${workerId}] 租到的账号凭据结构不对（${err.message}）—— 放弃执行`, 'error');
+          await report(tid, failure.localFailure(failure.KIND.PARAM,
+            `账号 #${(r.account && r.account.id) || '?'} 的凭据结构不对：${err.message}`));
+          state.active.delete(tid);
+          state.presence = state.active.size ? 'busy' : 'idle';
+          return;
+        }
+        account = { id: r.account.id, label: r.account.label || '' };
+        active.account = account.label || `#${account.id}`;
+        lease = true;
+        log(`[${workerId}] 任务 ${tid} 租到账号 ${active.account} `
+          + `（并发 ${r.account.running}/${r.account.max_slots}）`);
+        break;
+      }
+      // 租不到：池子空 → legacy 回落；全忙 → 等下一轮
+      const total = r && r.pool ? (Number(r.pool.total) || 0) : -1;
+      if (total === 0) {
+        log(`[${workerId}] 账号池为空 —— 回落全局会话（legacy 模式）执行任务 ${tid}`, 'warn');
+        break;
+      }
+      if (Date.now() > deadline) {
+        log(`[${workerId}] 任务 ${tid} 等了 ${Math.round(LEASE_WAIT_MS / 60000)} 分钟仍租不到账号`, 'error');
+        await report(tid, failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+          `等待可用账号超时（${Math.round(LEASE_WAIT_MS / 60000)} 分钟）—— `
+          + '账号池全忙或凭据均失效；请检查控制台账号状态'));
+        state.active.delete(tid);
+        state.presence = state.active.size ? 'busy' : 'idle';
+        return;
+      }
+      log(`[${workerId}] 账号全忙，租不到号 —— ${cfg.pollSeconds}s 后再试（任务 ${tid} 不判失败）`, 'warn');
+      await tiktok.sleep(cfg.pollSeconds * 1000);
+    }
+  }
+  if (stopping) {
+    state.active.delete(tid);
+    return;
+  }
+
+  // ---- 执行（lease 模式提交阶段失效会换号重试一次） ----
+  const failover = async () => {
+    try {
+      return await executeTask(task, session, beat, { lease });
+    } catch (err) {
+      // 只有「提交阶段会话失效且上游未建单」才值得换号重试 ——
+      // 带着 remoteTaskId 说明单已建、钱已花，换号重提等于第二单。
+      if (!lease || !account || !sessionruntime.isAuthExpired(err) || err.remoteTaskId) throw err;
+      const deadId = account.id;
+      log(`[${workerId}] 账号 #${deadId} 凭据失效（提交阶段）—— 标记失效并尝试换号重试一次`, 'warn');
+      try {
+        await client.reportAccount({
+          agent_id: cfg.agentId, account_id: deadId,
+          ok: false, code: sessionruntime.LOGIN_REQUIRED_CODE,
+          message: String(err.message).slice(0, 300),
+        });
+      } catch (e2) { log(`[${workerId}] 失效标记回报失败：${e2.message}`, 'warn'); }
+      try { await client.releaseSession({ taskId: tid, accountId: deadId }); } catch { /* 幂等 */ }
+      let r2 = null;
+      try {
+        r2 = await client.leaseSession({ backend, taskId: tid, exclude: [deadId] });
+      } catch (e3) { log(`[${workerId}] 换号租约失败：${e3.message}`, 'warn'); }
+      if (!(r2 && r2.ok && r2.session)) throw err;
+      try {
+        session = normalizeSession(r2.session);
+      } catch (e4) { throw err; }
+      account = { id: r2.account.id, label: r2.account.label || '' };
+      active.account = account.label || `#${account.id}`;
+      log(`[${workerId}] 已换到账号 ${active.account}，重试提交（此时上游未建单，安全）`, 'info');
+      return executeTask(task, session, beat, { lease: true });
+    }
+  };
+
+  let outcome;
+  try {
+    outcome = await failover();
+  } catch (err) {
+    // 失败也要**说清性质**：号池靠 error_kind 把「内容不合规」与
+    // 「会话过期」「节点掉线」分开 —— 三者处置方式完全不同，而改造前
+    // 在控制台上完全一样（都是 FAILED + 一段英文原文）。
+    outcome = failure.outcomeOf(err);
+  }
+
+  if (outcome.ok) {
+    state.done += 1;
+    log(`[${workerId}]   ✅ ${outcome.output_url.slice(0, 110)}`);
+  } else if (outcome.cancelled) {
+    // 取消不是故障：调用方已经自己把任务标成终态，号池会回 already_final。
+    state.cancelled += 1;
+    log(`[${workerId}]   ⏹ 已按调用方要求停止：${outcome.error}`, 'warn');
+  } else {
+    state.failed += 1;
+    const d = failure.describe(outcome.error_kind);
+    log(`[${workerId}]   ❌ 失败[${d.label}${outcome.error_code ? ` ${outcome.error_code}` : ''}]：`
+      + `${outcome.error}`, 'error');
+    // 不可重发的失败要**显式说一句** —— 这是运营最容易踩的坑：
+    // 「重发一次试试」在这种场景下每次都真的烧掉一次上游额度。
+    if (outcome.retryable === false) log(`     ↳ ${d.advice}`, 'warn');
+  }
+
+  state.lastTask = {
+    taskId: tid,
+    ok: outcome.ok,
+    detail: outcome.ok ? outcome.output_url.slice(0, 160) : outcome.error,
+    kind: outcome.error_kind || '',
+    at: Date.now(),
+  };
+  await report(tid, outcome);
+
+  // ---- 还槽：成功、失败、取消都要还；漏一次就永久少一个槽位 ----
+  if (account) {
+    try {
+      const rr = await client.releaseSession({ taskId: tid, accountId: account.id });
+      log(`[${workerId}] 已归还账号槽位 ${active.account}`
+        + `${rr && rr.released === false ? '（号池侧已释放，幂等）' : ''}`);
+    } catch (err) {
+      // 还槽失败不致命：号池有 reap_agent_leases 按 30 分钟兜底回收僵尸租约
+      log(`[${workerId}] 归还槽位失败（号池会按超时回收）：${err.message}`, 'warn');
+    }
+  }
+  state.active.delete(tid);
+  state.presence = state.active.size ? 'busy' : 'idle';
 }
 
 // ---------------------------------------------------------------------------
