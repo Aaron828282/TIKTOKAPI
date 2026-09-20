@@ -132,8 +132,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (path === '/status') {
-    const sess = sessionView();
-    json(res, 200, {
+    // 观测口绝不能 500（托管平台会把它当进程死了）。任何字段计算炸了都降级成
+    // 200 + error 说明 —— 观测挂掉比观测缺一块更害人。
+    try {
+      const sess = sessionView();
+      json(res, 200, {
       ok: true,
       node: 'tiktok-exec-node',
       node_version: process.version,
@@ -175,7 +178,11 @@ const server = http.createServer((req, res) => {
       cancelled: state.cancelled,
       last_task: state.lastTask,
       last_error: state.lastError,
-    });
+      });
+    } catch (err) {
+      json(res, 200, { ok: true, status_error: err.message,
+        uptime_sec: Math.round((Date.now() - state.startedAt) / 1000) });
+    }
     return;
   }
 
