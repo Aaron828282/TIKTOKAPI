@@ -252,6 +252,29 @@ async function resolveAll(host) {
 // ---------------------------------------------------------------------------
 // A. 机器体检
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 0. 配置自检 —— 不联网，先把「缺什么、会以什么形式坏掉」讲清楚
+// ---------------------------------------------------------------------------
+function partConfig() {
+  head('0. 配置自检 —— 缺什么、会以什么形式坏掉');
+
+  const { cfg, validate } = require('./lib/config');
+  const v = validate();
+
+  // 这两类不按「断言」呈现：它们描述的是配置状态，不是通过/失败。
+  // 逐条打印完整原文 —— 一句被截断的报错等于没有报错。
+  for (const m of v.warn) console.log(`  [WARN] ${m}`);
+  for (const m of v.fatal) console.log(`  [FAIL] ${m}`);
+
+  rec('配置无致命项', v.fatal.length === 0,
+    v.fatal.length ? `有 ${v.fatal.length} 项致命配置问题（见上）` : `提示 ${v.warn.length} 条`);
+  rec('号池地址与节点标识已就位', true, `${cfg.poolUrl} · agent_id=${cfg.agentId}`);
+  return { fatal: v.fatal.length };
+}
+
+// ---------------------------------------------------------------------------
+// A. 机器体检
+// ---------------------------------------------------------------------------
 async function partA(proxy) {
   head('A. 机器体检 —— 这台机器是不是干活的材料');
 
@@ -452,6 +475,63 @@ async function partC(proxy) {
 }
 
 // ---------------------------------------------------------------------------
+// D. 节点 -> 交付收件端
+// ---------------------------------------------------------------------------
+async function partD(proxy) {
+  head('D. 交付路径 —— 成品要送到哪、送得到吗');
+
+  const mode = String(process.env.RH_OUTPUT_MODE || 'mirror').toLowerCase();
+  const mirror = String(process.env.RH_MIRROR_URL || '').trim();
+
+  if (!rec('RH_OUTPUT_MODE 合法', ['cdn', 'mirror'].includes(mode), `mode=${mode}`)) return;
+
+  if (mode === 'cdn') {
+    // 不拦成失败：人工验证时 cdn 是合法选择。但必须说清代价。
+    rec('交付方式 = cdn', false,
+      'cdn 只回报 TikTok 直链：下游归档过不了域名白名单 / 缺 Referer / 小时级过期三道门，'
+      + '只能人工验证，不能当生产交付', false);
+  } else if (!mirror) {
+    rec('RH_MIRROR_URL 已配置', false, 'mirror 模式必填 —— 否则每个任务都会在交付环节失败');
+    return;
+  } else {
+    rec('RH_MIRROR_URL 已配置', true, mirror);
+    // 号池的 /api/v1/upload 是 multipart 图片口（走重压缩、默认 10MB），收不了 mp4。
+    // 这条错法在备忘里出现过，直接在验收里挡住。
+    if (/\/api\/v1\/upload\b/.test(mirror)) {
+      rec('收件端不是号池的图片上传口', false,
+        '号池 /api/v1/upload 是 multipart 图片口（重压缩 / 10MB 上限），收不了 mp4；'
+        + '要用网站侧的专用令牌端点');
+    }
+  }
+
+  if (mode !== 'mirror' || !mirror) return;
+
+  let u;
+  try {
+    u = new URL(mirror);
+  } catch (err) {
+    rec('RH_MIRROR_URL 是合法 URL', false, err.message.slice(0, 70));
+    return;
+  }
+  const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+  try {
+    const ms = await tcpProbe(u.hostname, port, proxy);
+    rec(`收件端 TCP 可达 ${u.hostname}:${port}`, true, `connect=${(ms / 1000).toFixed(3)}s`);
+  } catch (err) {
+    rec(`收件端 TCP 可达 ${u.hostname}:${port}`, false, err.message.slice(0, 80));
+    return;
+  }
+  if (u.protocol === 'https:') {
+    try {
+      const peer = await tlsPeer(u.hostname, proxy);
+      rec('收件端 TLS 可达', true, `CN=${peer.subject} 有效期至 ${peer.validTo}`);
+    } catch (err) {
+      rec('收件端 TLS 可达', false, err.message.slice(0, 80));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 function summary() {
   head('汇总');
   const req = RESULTS.filter((r) => r.required);
@@ -490,6 +570,9 @@ function parseArgs(argv) {
     }
   }
   if (['none', '-', ''].includes(String(out.proxy).toLowerCase())) out.proxy = '';
+  // ⚠️ `--ca` 必须同步进环境变量：第 0 节的配置自检读的是 `lib/config`（只看环境变量），
+  //    不把这层对齐，就会出现「命令行给了 CA、自检却说没配」的自相矛盾。
+  if (out.ca && !process.env.RH_POOL_CA_FILE) process.env.RH_POOL_CA_FILE = out.ca;
   return out;
 }
 
@@ -503,9 +586,11 @@ async function main() {
   console.log(`  号池 ${args.pool}`);
   console.log('='.repeat(86));
 
+  await partConfig();
   await partA(args.proxy);
   await partB(args.pool, args.proxy, args.token, args.ca);
   if (!args.skipUpstream) await partC(args.proxy);
+  await partD(args.proxy);
   process.exit(summary());
 }
 

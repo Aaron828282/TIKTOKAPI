@@ -16,3 +16,6 @@ __pycache__
 *.pyc
 *.md
 !README.md
+
+# 自测夹具：里面是假的 TikTok 上游，镜像里用不到（那是给本地/CI 跑的）
+selftest

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "selftest": "node lib/sigv4.js",
+    "selftest": "node lib/sigv4.js && node selftest/offline.js",
     "preflight": "node preflight.js"
   },
   "dependencies": {},
