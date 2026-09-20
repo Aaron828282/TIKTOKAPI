@@ -788,6 +788,14 @@ async function runTask(task, workerId) {
       log(`[${workerId}] 归还槽位失败（号池会按超时回收）：${err.message}`, 'warn');
     }
   }
+
+  // ---- 任务后积分快照：控制台「积分合计」跟着每次消耗即时走 ----
+  // 只在 lease 模式（知道账号 id）下做；失败不影响任何结果，见
+  // sessionruntime.refreshAccountInfo 的注释。fire-and-forget：别拖住下一个任务。
+  if (lease && account && session && !stopping) {
+    sessionruntime.refreshAccountInfo(client, session, account.id, log)
+      .catch(() => {});
+  }
   state.active.delete(tid);
   state.presence = state.active.size ? 'busy' : 'idle';
 }
