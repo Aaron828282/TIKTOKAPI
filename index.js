@@ -24,7 +24,15 @@
  * ----------------
  * 实测推翻了「必须靠页面签名」的旧结论：cookie + `x-creative-source` 直连
  * 就能建单、轮询、下载，参考图也能用 SigV4 自己签着传上去。
- * 浏览器只剩「每 ~3 天刷 cookie」这一个用途 —— 而那件事可以在任何地方做。
+ * 浏览器只剩「每 ~3 天刷 cookie」这一个用途 —— 而那件事可以在任何地方做，
+ * **今天就在号池控制台做**（见下）。
+ *
+ * 凭据来源（2026-09-20 改造）
+ * --------------------------
+ * 广告线会话 TTL 只有 3 天，「换 cookie」是**每 3 天一次的日常动作**，
+ * 不是一次性的部署配置。所以凭据的持有者不在这个进程里 —— 号池持有、
+ * 控制台切换，本进程按版本号按需索取（`lib/sessionruntime.js`）。
+ * 换 cookie 不再需要碰这个节点的任何环境变量、更不需要重新部署。
  *
  * 两个容易漏掉的职责
  * ------------------
@@ -39,10 +47,11 @@
  */
 const http = require('node:http');
 
-const { cfg, loadSession, hasSession, validate, sessionStatus } = require('./lib/config');
+const { cfg, loadSession, hasSession, validate, sessionStatus, sessionOrigin } = require('./lib/config');
 const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, clampDuration } = require('./lib/payload');
 const { uploadImage } = require('./lib/upload');
+const sessionruntime = require('./lib/sessionruntime');
 const tiktok = require('./lib/tiktok');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -72,10 +81,29 @@ const state = {
   lastError: null,
   poolOk: null,           // 最近一次号池自检结果
   presence: 'starting',
-  session: null,          // { ok, code, message, at } —— 启动时那次会话探活
-  sessionLifetime: null,  // { level, note, remain } —— 广告线会话还剩多久
   skips: 0,               // peer 次数（观测用，确认取消检测真的在工作）
 };
+
+/**
+ * 会话的两块观测信息 —— **现算**，不做状态缓存。
+ *
+ * 为什么现算：凭据会在**运行中**被换掉（控制台改了 → 定时刷新拉到新的）。
+ * 早先这两块是在启动时算一次就塞进 `state` 的，结果是热切换之后
+ * `/status` 里的「还剩多久」和「验活结论」永远停在启动那一刻 ——
+ * 一个**看起来在更新、其实是旧结论**的观测口，比没有更坏。
+ */
+function sessionView() {
+  const st = sessionStatus();
+  const s = sessionruntime.status();
+  return {
+    lifetime: st
+      ? { level: st.level, note: st.note, remain: st.lifetime && st.lifetime.remain }
+      : null,
+    probe: s.probeAt
+      ? { ok: s.probeOk, code: s.probeCode, at: s.probeAt }
+      : null,
+  };
+}
 
 const client = createClient(cfg);
 
@@ -102,6 +130,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (path === '/status') {
+    const sess = sessionView();
     json(res, 200, {
       ok: true,
       node: 'tiktok-exec-node',
@@ -115,9 +144,15 @@ const server = http.createServer((req, res) => {
       // ⚠️ 只回布尔，不回令牌本身
       agent_token_set: Boolean(cfg.agentToken),
       session_ready: hasSession(),
-      session_probe: state.session,
+      session_probe: sess.probe,
       // 「还剩多久」—— 广告线 TTL 只有 3 天，这是唯一能提前预警的字段
-      session_lifetime: state.sessionLifetime,
+      session_lifetime: sess.lifetime,
+      // 凭据是哪来的：'cache'（号池控制台）/'env'（托管面板）。
+      // 决定了换 cookie 要去哪儿操作 —— 这两个地方的处置路径完全不同。
+      session_source: cfg.sessionSource,
+      session_origin: sessionOrigin(),
+      session_backend: cfg.sessionBackend,
+      session_pool: sessionruntime.status(),
       // 交付路径能不能用 —— 别等出片才发现收件端没配
       output_mode: cfg.outputMode,
       output_ready: cfg.outputMode !== 'mirror' || Boolean(cfg.mirrorUrl),
@@ -195,7 +230,7 @@ async function executeTask(task) {
     return { ok: false, error: `任务 ${task.task_id} 没带 agent.model_id，无法执行` };
   }
 
-  const session = loadSession();
+  const backend = task.backend || cfg.sessionBackend;
   const prompt = task.prompt || '';
   const images = (task.image_urls || []).filter(Boolean);
   const duration = clampDuration(task.duration);
@@ -210,19 +245,31 @@ async function executeTask(task) {
     };
   }
 
-  // ---- 参考图：不在 TikTok 图床的一律重传（上游只收自家素材）----
-  await beat('UPLOADING', 2);
-  const resolved = [];
-  for (let i = 0; i < images.length; i += 1) {
-    log(`  参考图 ${i + 1}/${images.length}`);
-    resolved.push(await uploadImage(session, cfg, images[i], log));
-  }
+  // ---- 参考图 + 提交 ----
+  //
+  // 这一段被包在 withSubmitRetry 里：**只有这里**允许因会话失效（10001106）
+  // 强刷凭据后重来一次 —— 因为此时上游还没有建单，重试不会造成第二次消耗。
+  // 轮询阶段（下面）绝不重试，理由见那里。
+  const uploadAndSubmit = async () => {
+    // ⚠️ 每次进来都**重新读一遍**凭据。重试路径上号池可能刚换过一份，
+    //    用闭包里捕获的旧 session 会让「重试」变成原样再撞一次墙。
+    const session = loadSession(backend);
 
-  // ---- 提交 ----
-  const payload = buildPayload(prompt, resolved, modelId, duration);
-  await beat('SUBMITTING', 5);
-  log(`  提交中（body ${Buffer.byteLength(JSON.stringify(payload))} 字节）…`);
-  const submitted = await tiktok.submit(session, cfg, payload, log);
+    await beat('UPLOADING', 2);
+    const resolved = [];
+    for (let i = 0; i < images.length; i += 1) {
+      log(`  参考图 ${i + 1}/${images.length}`);
+      resolved.push(await uploadImage(session, cfg, images[i], log));
+    }
+
+    const payload = buildPayload(prompt, resolved, modelId, duration);
+    await beat('SUBMITTING', 5);
+    log(`  提交中（body ${Buffer.byteLength(JSON.stringify(payload))} 字节）…`);
+    return { submitted: await tiktok.submit(session, cfg, payload, log), session };
+  };
+
+  const { submitted, session } = await sessionruntime.withSubmitRetry(
+    uploadAndSubmit, { client, log, backend });
 
   // ---- 轮询 ----
   await beat('AGENT_RUNNING', 8);
@@ -241,31 +288,50 @@ async function executeTask(task) {
   let peeking = false;
   let lastPeek = 0;
 
-  const result = await tiktok.poll(session, cfg, submitted.taskId, {
-    timeoutMs: cfg.jobTimeoutSeconds * 1000,
-    intervalMs: 8000,
-    log,
-    onTick: (progress) => {
-      // 轮询期间给号池打心跳（号池按 agent_timeout 给任务收尸，心跳停不得）
-      beat('AGENT_RUNNING', progress);
+  let result;
+  try {
+    result = await tiktok.poll(session, cfg, submitted.taskId, {
+      timeoutMs: cfg.jobTimeoutSeconds * 1000,
+      intervalMs: 8000,
+      log,
+      onTick: (progress) => {
+        // 轮询期间给号池打心跳（号池按 agent_timeout 给任务收尸，心跳停不得）
+        beat('AGENT_RUNNING', progress);
 
-      if (cfg.peekSeconds > 0 && !peeking && Date.now() - lastPeek >= cfg.peekSeconds * 1000) {
-        lastPeek = Date.now();
-        peeking = true;
-        client.peek(task.task_id)
-          .then((r) => {
-            state.skips += 1;
-            if (r && r.cancelled) {
-              cancelFlag = true;
-              log(`  号池标记该任务不再需要（status=${r.status}）—— 停止轮询`, 'warn');
-            }
-          })
-          .catch((err) => { if (cfg.logLevel === 'debug') log(`  peek 失败：${err.message}`, 'debug'); })
-          .finally(() => { peeking = false; });
-      }
-      return cancelFlag ? { stop: true } : null;
-    },
-  });
+        if (cfg.peekSeconds > 0 && !peeking && Date.now() - lastPeek >= cfg.peekSeconds * 1000) {
+          lastPeek = Date.now();
+          peeking = true;
+          client.peek(task.task_id)
+            .then((r) => {
+              state.skips += 1;
+              if (r && r.cancelled) {
+                cancelFlag = true;
+                log(`  号池标记该任务不再需要（status=${r.status}）—— 停止轮询`, 'warn');
+              }
+            })
+            .catch((err) => { if (cfg.logLevel === 'debug') log(`  peek 失败：${err.message}`, 'debug'); })
+            .finally(() => { peeking = false; });
+        }
+        return cancelFlag ? { stop: true } : null;
+      },
+    });
+  } catch (err) {
+    if (!sessionruntime.isAuthExpired(err)) throw err;
+
+    // 🔴 轮询期间会话失效 —— **绝不重新提交**。
+    // 上游的生成任务此刻已经建好了（钱已经花了），重提等于建第二单：
+    // 白烧一次额度，而号池那边因为已有终态会把第二次结果直接丢掉 ——
+    // 花了钱、连个报错都看不见。这与「Dify 提交节点不许开自动重试」同源。
+    log('轮询期间会话失效 —— 向号池刷新凭据并回报状态；'
+      + '**不重新提交**（上游任务已建单，重提只会造成第二次消耗）', 'warn');
+    await sessionruntime.refresh(client, log, {
+      force: true, reason: 'poll-10001106', probe: true, backend,
+    });
+    const e = new Error(`${err.message} —— 上游任务已建单，未重新提交（避免重复消耗）。`
+      + '请到号池控制台换一份会话凭据，这条订单需要重新发起');
+    e.cause = err;
+    throw e;
+  }
 
   const meta = result.bestMeta || {};
   log(`  出片 ${result.elapsedSec}s · 最佳档 ${meta.Width}×${meta.Height} ` +
@@ -416,34 +482,48 @@ async function loop() {
     // 不退出：号池侧可能还在配置中。平台会把我们拉起来，保持监听并重试更稳。
   }
 
-  // ---- 启动自检 2：会话还活着吗 ----
+  // ---- 启动自检 2：会话凭据 —— 先向号池取，再验活 ----
+  //
+  // 取 / 验 / 回报三步都在 sessionruntime 里，这里只把结论写进启动日志。
+  // 顺序很重要：**先取**。凭据的持有者是号池，本地环境变量只是兜底，
+  // 所以「本地没配」在 auto/pool 模式下不是问题，「号池也没有」才是。
+  const sr = await sessionruntime.start(client, log);
+
   if (!hasSession()) {
-    log('⚠️ 未提供会话凭据（RH_SESSION_JSON / RH_SESSION_FILE）—— ' +
-      '节点能接单但无法执行。补齐后重启即可。', 'warn');
-  } else {
-    // 先报「还剩多久」。广告线 TTL 只有 3 天，这个数字比「探活通过」更早预警 ——
-    // 探活只告诉你「现在还活着」，剩 2 小时它也这么说。
-    const st = sessionStatus();
-    if (st) {
-      state.sessionLifetime = { level: st.level, note: st.note, remain: st.lifetime && st.lifetime.remain };
-      const tag = st.level === 'dead' ? '🔴' : (st.level === 'warn' ? '⚠️' : '·');
-      log(`${tag} ${st.note}（cookie ${st.cookieKeys.length} 键）`,
-        st.level === 'ok' ? 'info' : (st.level === 'warn' ? 'warn' : 'error'));
+    if (cfg.sessionSource === 'env') {
+      log('⚠️ RH_SESSION_SOURCE=env，且本地没有可用凭据 —— 节点能接单但无法执行。',
+        'warn');
+    } else {
+      log(`⚠️ 号池没有可用的会话凭据${sr && sr.note ? `（${sr.note}）` : ''} —— `
+        + '节点能接单但无法执行。到号池控制台的「TikTok 会话凭据」粘贴一份即可，'
+        + '不需要改这个节点的环境变量、更不用重新部署。', 'warn');
     }
-    try {
-      const probe = await tiktok.probeSession(loadSession(), cfg);
-      state.session = { ok: probe.alive, code: probe.code, message: probe.message, at: Date.now() };
-      log(probe.alive
-        ? `会话探活通过（code=${probe.code}）`
-        : `🔴 会话已失效（code=${probe.code} ${probe.message}）—— 需要刷新 cookie`, probe.alive ? 'info' : 'error');
-    } catch (err) {
-      state.session = { ok: null, code: null, message: err.message, at: Date.now() };
-      log(`会话探活异常：${err.message}`, 'warn');
+  } else {
+    // 先把「还剩多久」讲清楚。广告线 TTL 只有 3 天，这个数字比「探活通过」
+    // 更早预警 —— 探活只告诉你「现在还活着」，剩 2 小时它也这么说。
+    const st = sessionStatus();
+    const origin = sessionOrigin();
+    if (st) {
+      const tag = st.level === 'dead' ? '🔴' : (st.level === 'warn' ? '⚠️' : '·');
+      log(`${tag} ${st.note}（cookie ${st.cookieKeys.length} 键 · 来源 ${origin === 'cache'
+        ? '号池控制台' : '本地环境变量'}）`,
+      st.level === 'ok' ? 'info' : (st.level === 'warn' ? 'warn' : 'error'));
+    }
+
+    // 拿到新凭据时 start() 内部已经验活并回报过；只有「没换、纯重启」时才补一次，
+    // 否则控制台上那个「有效 / 已失效」的结论会一直停在上次的时点。
+    // （结论不在这里落状态 —— /status 是现算的，见 sessionView()。）
+    if (!(sr && sr.changed)) {
+      await sessionruntime.probeAndReport(client, log, { reason: 'startup' });
     }
   }
 
   log(`节点启动 agent_id=${cfg.agentId} · 轮询间隔 ${cfg.pollSeconds}s · `
     + `输出模式 ${cfg.outputMode} · 取消检测 ${cfg.peekSeconds ? `${cfg.peekSeconds}s` : '关闭'}`);
+  log(`会话凭据：来源策略 ${cfg.sessionSource} · 当前来自 `
+    + `${sessionOrigin() === 'cache' ? '号池控制台' : '本地环境变量'} · `
+    + `每 ${cfg.sessionRefreshSeconds}s 向号池问一次变更 · 每 `
+    + `${Math.round(cfg.sessionProbeSeconds / 3600)}h 验活一次`);
 
   while (!stopping) {
     let task = null;
@@ -510,6 +590,7 @@ async function loop() {
 function shutdown(signal) {
   if (stopping) return;
   stopping = true;
+  sessionruntime.stop();
   log(`收到 ${signal}，停止取活并退出 …`);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();

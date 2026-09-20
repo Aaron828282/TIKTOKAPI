@@ -10,8 +10,9 @@
   "scripts": {
     "start": "node index.js",
     "preflight": "node preflight.js",
-    "selftest": "node lib/sigv4.js && node selftest/session.js && node selftest/offline.js",
+    "selftest": "node lib/sigv4.js && node selftest/session.js && node selftest/sessionpool.js && node selftest/offline.js",
     "selftest:session": "node selftest/session.js",
+    "selftest:sessionpool": "node selftest/sessionpool.js",
     "session:from-curl": "node tools/from-curl.js",
     "session:check": "node preflight.js --session-only"
   },
