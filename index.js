@@ -228,7 +228,10 @@ async function executeTask(task) {
   const spec = task.agent || {};
   const modelId = String(spec.model_id || '');
   if (!modelId) {
-    return { ok: false, error: `任务 ${task.task_id} 没带 agent.model_id，无法执行` };
+    // 提前 return 也要带分类 —— 否则这类失败在号池里又是「FAILED 但 error_kind 为空」，
+    // 等于把刚补上的「分不清」问题在另一条分支上重新打开。
+    return failure.localFailure(failure.KIND.PARAM,
+      `任务 ${task.task_id} 没带 agent.model_id，无法执行`);
   }
 
   const backend = task.backend || cfg.sessionBackend;
@@ -239,11 +242,9 @@ async function executeTask(task) {
   log(`  模型 ${task.model_name || spec.model_key}（${modelId}）· ${duration}s · ${images.length} 张参考图`);
 
   if (!images.length) {
-    return {
-      ok: false,
-      error: '外部后端需要参考图，且必须是节点能取到的公网地址：请用控制台的「参考图」'
-        + '上传本地图片（会先托管到公网），或直接填一个公网可访问的图片地址',
-    };
+    return failure.localFailure(failure.KIND.PARAM,
+      '外部后端需要参考图，且必须是节点能取到的公网地址：请用控制台的「参考图」'
+      + '上传本地图片（会先托管到公网），或直接填一个公网可访问的图片地址');
   }
 
   // ---- 参考图 + 提交 ----

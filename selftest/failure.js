@@ -133,7 +133,56 @@ check('中文标签可用', d.label === '内容不合规', d.label);
 check('给了「别急着重发」的明确指引', /重发会被同样拒绝/.test(d.advice));
 
 // ---------------------------------------------------------------------------
-section('A5 · 源码级断言：不重试这条线没有被改坏');
+section('A5 · localFailure：提前 return 的失败也必须带分类');
+
+// 起因：executeTask 里「缺参考图」「缺 agent.model_id」是**不进 catch 的提前
+// return**。改造时只接了 catch 分支，这两处于是仍落成「FAILED 但 error_kind 空」
+// —— 2026-09-20 一次零成本探针任务当场撞出来（号池里 error_kind=''）。
+const lf = failure.localFailure(K.PARAM, '外部后端需要参考图…');
+check('ok=false', lf.ok === false);
+check('带 error_kind', lf.error_kind === K.PARAM, lf.error_kind);
+check('PARAM 不可重发（原样再发还是同样错）', lf.retryable === false, String(lf.retryable));
+check('载荷键集合与 outcomeOf 一致（调用方不该见到两种长相）',
+  Object.keys(lf).sort().join(',') === Object.keys(failure.outcomeOf(upstream(10043300, 'x'))).sort().join(','),
+  Object.keys(lf).sort().join(','));
+check('认不出的 kind 不谎报 → UNKNOWN',
+  failure.localFailure('NOT_A_KIND', 'x').error_kind === K.UNKNOWN);
+check('缺 message 不把 undefined 写进库',
+  !failure.localFailure(K.PARAM).error.includes('undefined'),
+  failure.localFailure(K.PARAM).error);
+
+// retryable 只允许有**一份真相源**：classify 与 retryableOf 对同一 kind
+// 必须给出同一个结论，否则运营会看到「这条能重发」和「这条别重发」并存。
+const samples = {
+  [K.CONTENT_MODERATION]: upstream(10043300, 'policy violation'),
+  [K.SESSION_EXPIRED]: upstream(10001106, 'Login Required'),
+  [K.TIMEOUT]: Object.assign(new Error('轮询超时'), { localTimeout: true }),
+  [K.CANCELLED]: Object.assign(new Error('调用方取消'), { cancelled: true }),
+  [K.QUOTA]: new Error('insufficient quota'),
+  [K.PARAM]: new Error('invalid parameter: duration'),
+  [K.UPSTREAM_ERROR]: Object.assign(new Error('upstream blew up'), { transient: true }),
+  [K.UNKNOWN]: new Error('完全没见过的一种炸法'),
+};
+let drift = [];
+for (const [kind, sample] of Object.entries(samples)) {
+  const got = failure.classify(sample);
+  if (got.kind !== kind) drift.push(`${kind} 样本被归成 ${got.kind}`);
+  else if (got.retryable !== failure.retryableOf(kind)) {
+    drift.push(`${kind}: classify=${got.retryable} retryableOf=${failure.retryableOf(kind)}`);
+  }
+}
+check('8 类样本都归到自己那一类，且 retryable 与真相源一致',
+  drift.length === 0, drift.join(' / '));
+
+// 源码级：这两处提前 return 必须已经走 localFailure（别改回去）
+const idxSrc = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+check('「缺参考图」走 localFailure',
+  /if \(!images\.length\) \{\s*return failure\.localFailure/.test(idxSrc));
+check('「缺 agent.model_id」走 localFailure',
+  /if \(!modelId\) \{[\s\S]{0,400}?return failure\.localFailure/.test(idxSrc));
+
+// ---------------------------------------------------------------------------
+section('A6 · 源码级断言：不重试这条线没有被改坏');
 
 const root = path.join(__dirname, '..');
 const idx = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
