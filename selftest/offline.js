@@ -215,19 +215,35 @@ async function scenario(name, opts, check) {
     ok('本地已把片子下载下来（字节数对得上）', m.bytes === 1500000, `${m.bytes} 字节`);
   });
 
-  // ---- 场景 4：体积超闸门 → 就地失败，不浪费一次上传 ----
-  await scenario('场景 4 · 成片超过收件端体积闸门', { mode: 'mirror', oversize: true }, ({ seen, result, log }) => {
-    ok('回报失败而不是静默成功', Boolean(result) && result.ok === false);
-    ok('失败原因点明体积与闸门', /MB/.test(String(result && result.error)) && /25MB|上限/.test(String(result && result.error)),
-      String(result && result.error).slice(0, 90));
+  // ---- 场景 4：体积超闸门 → 不浪费上传，但仍交付直链 ----
+  //
+  // 契约变更（2026-09-20）：**交付失败不再连坐成任务失败**。
+  // 片子这时已经生成、上游额度已经扣了，因为「搬不回自己的存储」就把整条
+  // 任务判失败，等于钱花了、成品丢了、上游任务号也没回报。现在统一降级为
+  // 直链交付，用 `archived=false` + `archive_note` 把「没归档」这件事讲清楚。
+  await scenario('场景 4 · 成片超过收件端体积闸门', { mode: 'mirror', oversize: true }, ({ seen, result }) => {
+    ok('任务仍然成功（已生成的片子不能因交付连坐）', Boolean(result) && result.ok === true);
+    ok('降级交付的是直链', /^https?:/.test(String(result && result.output_url)),
+      String(result && result.output_url).slice(0, 70));
+    ok('archived=false 表明没进下游存储', Boolean(result) && result.archived === false);
+    ok('说明里点明体积与闸门', /MB/.test(String(result && result.archive_note))
+      && /25MB|上限/.test(String(result && result.archive_note)),
+      String(result && result.archive_note).slice(0, 100));
     ok('没有真的发起上传', seen.mirrors.length === 0);
+    ok('仍然回报了上游任务号（可追溯）', Boolean(result && result.remote_task_id),
+      String(result && result.remote_task_id));
   });
 
-  // ---- 场景 5：没配收件端的 mirror → 交付环节给一句能照做的报错 ----
+  // ---- 场景 5：没配收件端的 mirror → 降级直链，并在说明里点出要补哪个变量 ----
   await scenario('场景 5 · mirror 但没配 RH_MIRROR_URL', { mode: 'mirror', noMirrorUrl: true }, ({ result }) => {
-    ok('回报失败', Boolean(result) && result.ok === false);
-    ok('报错里写清了要补哪个变量', /RH_MIRROR_URL/.test(String(result && result.error)),
-      String(result && result.error).slice(0, 90));
+    ok('任务仍然成功', Boolean(result) && result.ok === true);
+    ok('交付的是直链（人工仍可取回）', /^https?:/.test(String(result && result.output_url)),
+      String(result && result.output_url).slice(0, 70));
+    ok('archived=false', Boolean(result) && result.archived === false);
+    ok('说明里写清了要补哪个变量', /RH_MIRROR_URL/.test(String(result && result.archive_note)),
+      String(result && result.archive_note).slice(0, 100));
+    ok('仍然回报了上游任务号（可追溯）', Boolean(result && result.remote_task_id),
+      String(result && result.remote_task_id));
   });
 
   console.log('\n' + '='.repeat(70));

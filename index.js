@@ -338,22 +338,37 @@ async function executeTask(task) {
     `(${meta.Format || '?'}, ${meta.Size || '?'}B) · ${result.nVideos} 个变体`);
 
   // ---- 交付 ----
+  //
+  // 🔴 交付失败 ≠ 任务失败。走到这里片子已经生成、上游额度**已经扣了**，
+  //    因为「搬不回自己的存储」就把整条任务判失败，是最差的结果：
+  //    钱花了、成品丢了、连上游任务号都没回报，事后无法追溯。
+  //    所以两个失败分支（没配 RH_MIRROR_URL / 收件端拒绝）都**降级为直链交付**，
+  //    任务照常成功，只是 `archived=false`。
   let outputUrl = result.bestUrl;
+  let archived = false;
+  let archiveNote = '';
   if (cfg.outputMode === 'mirror') {
     if (!cfg.mirrorUrl) {
-      throw new Error('RH_OUTPUT_MODE=mirror 但没配 RH_MIRROR_URL —— '
-        + '下游归档不了 TikTok 直链（域名白名单 + 缺 Referer + 小时级过期），'
-        + '所以这条任务只能失败；请在节点上补 RH_MIRROR_URL');
+      archiveNote = 'RH_OUTPUT_MODE=mirror 但未配 RH_MIRROR_URL —— 已降级为直链交付；'
+        + '下游归档会失败（域名白名单 / 缺 Referer / 小时级过期），请补 RH_MIRROR_URL';
+      log('  ⚠️ ' + archiveNote, 'warn');
+    } else {
+      try {
+        log('  下载成片并转存（mirror 模式）…');
+        const bytes = await tiktok.download(result.bestUrl, cfg);
+        log(`  已下载 ${(bytes.length / 1048576).toFixed(2)}MB，POST 给收件端 …`);
+        // ⚠️ 文件名必须用**号池任务号**（`task.task_id`），不是 `result.taskId`。
+        // `result.taskId` 是 TikTok 侧的任务号（也就是回报里的 remote_task_id），
+        // 号池把它对客户隐藏，网站拿不到、无法反查用户 —— 收件方按它落库会变成孤儿资产。
+        // 号池任务号 = 网站 generation_jobs.upstream_task_id，收件方可以据此确认归属。
+        outputUrl = await mirror(bytes, `${task.task_id}.mp4`, task.task_id);
+        archived = true;
+        log(`  已转存 → ${outputUrl.slice(0, 100)}`);
+      } catch (err) {
+        archiveNote = `转存失败（${err.message}）—— 已降级为直链交付，任务仍算成功`;
+        log('  ⚠️ ' + archiveNote, 'warn');
+      }
     }
-    log('  下载成片并转存（mirror 模式）…');
-    const bytes = await tiktok.download(result.bestUrl, cfg);
-    log(`  已下载 ${(bytes.length / 1048576).toFixed(2)}MB，POST 给收件端 …`);
-    // ⚠️ 文件名必须用**号池任务号**（`task.task_id`），不是 `result.taskId`。
-    // `result.taskId` 是 TikTok 侧的任务号（也就是回报里的 remote_task_id），
-    // 号池把它对客户隐藏，网站拿不到、无法反查用户 —— 收件方按它落库会变成孤儿资产。
-    // 号池任务号 = 网站 generation_jobs.upstream_task_id，收件方可以据此确认归属。
-    outputUrl = await mirror(bytes, `${task.task_id}.mp4`, task.task_id);
-    log(`  已转存 → ${outputUrl.slice(0, 100)}`);
   } else {
     log('  ⚠️ cdn 模式：回报的是 TikTok CDN 直链（需 Referer、小时级过期）。'
       + '下游多半归档不了，这条路径只适合人工验证。', 'warn');
@@ -369,6 +384,10 @@ async function executeTask(task) {
     // 带完整 VideoMeta 的变体数组（号池按 JSON 文本落库、原样取回）。
     // ⚠️ 别压成字符串数组：分辨率阶梯是这条记录唯一的分析价值。
     output_variants: result.variants || [],
+    // 归档状态单独报出来：号池据此能区分「成品在自己存储里」与「只是个会过期的直链」。
+    // 号池侧若不认这个键会直接忽略，不影响兼容。
+    archived,
+    archive_note: archiveNote,
     // TikTok 侧扣的是账号额度，拿不到现金价 —— 记 0，别编一个数
     fee: 0,
   };
