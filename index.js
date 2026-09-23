@@ -396,23 +396,52 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
 
   // ---- 生图交付（与视频分叉）----
   //
-  // 图片直链与视频不同：`x-expires` 约**一年**（不是小时级），且 CDN 不带
-  // Referer 也 200（2026-09-23 双向实测）。下游网站本来就能直抓 tiktokcdn
-  // （media-hosts 白名单 + Referer 逻辑都在），所以这里**不做 mirror**，
-  // 直接把 N 条直链回报上去 —— 第一条进 output_url，全部进 output_variants。
+  // TikTok 图片 CDN 在国内被 DNS 污染（2026-09-23 实测
+  // p16-ad-site-sign-sg.tiktokcdn.com 解析到 Dropbox 的 IP），下游网站直抓
+  // **必然失败** —— 与视频同理，mirror 转存是唯一可行交付路径。
+  // 节点逐张下载后上传收件端（X-Relay-Part-Index 标序号），换回站内签名 URL
+  // 回报；任一张转存失败则整单降级直链交付（链路可达性由下游自负）。
   if (isImageJob) {
     const urls = result.urls || [];
     log(`  出图 ${result.elapsedSec}s · ${urls.length} 张`);
+    let outputUrls = urls;
+    let archived = false;
+    let archiveNote = '';
+    if (cfg.outputMode === 'mirror' && cfg.mirrorUrl) {
+      try {
+        const mirrored = [];
+        for (let i = 0; i < urls.length; i += 1) {
+          const bytes = await tiktok.downloadImage(urls[i], cfg);
+          log(`  转存 ${i + 1}/${urls.length}（${(bytes.length / 1048576).toFixed(2)}MB）…`);
+          mirrored.push(await mirror(bytes, `${task.task_id}-${i + 1}.png`, task.task_id, {
+            partIndex: i + 1,
+            contentType: 'image/png',
+          }));
+        }
+        outputUrls = mirrored;
+        archived = true;
+      } catch (err) {
+        archiveNote = `图片转存失败（${err.message}）—— 已降级为直链交付`;
+        log('  ⚠️ ' + archiveNote, 'warn');
+      }
+    } else {
+      archiveNote = 'mirror 未配置 —— 已降级为直链交付（下游直抓 TikTok 图片 CDN 会被 DNS 污染挡住）';
+      log('  ⚠️ ' + archiveNote, 'warn');
+    }
     return {
       ok: true,
-      output_url: urls[0] || '',
+      output_url: outputUrls[0] || '',
       output_type: 'image',
       output_size: '',
       expire_time: '',
       remote_task_id: submitted.taskId,
-      output_variants: urls.map((url) => ({ url })),
-      archived: true,
-      archive_note: 'image-direct-links',
+      output_variants: urls.map((direct, i) => ({
+        url: outputUrls[i] || direct,
+        direct_url: direct,
+        archived: Boolean(outputUrls[i] && archived),
+      })),
+      archived,
+      archive_note: archiveNote,
       // TikTok 侧扣的是账号生图额度，拿不到现金价 —— 记 0，别编一个数
       fee: 0,
     };
@@ -495,7 +524,7 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
  * 收件方应校验这个号确实是它自己下过单的任务，**再由它自己决定落点**
  * （别让上传方指定存储路径，否则等于把别人资产的开写权限交出去）。
  */
-async function mirror(bytes, filename, taskId = '') {
+async function mirror(bytes, filename, taskId = '', { partIndex = 0, contentType = 'video/mp4' } = {}) {
   const maxBytes = cfg.mirrorMaxMb * 1024 * 1024;
   if (bytes.length > maxBytes) {
     // 就地失败比传一半被 413 打回好：前者错误信息完整，后者连日志都看不全
@@ -511,10 +540,11 @@ async function mirror(bytes, filename, taskId = '') {
     res = await fetch(cfg.mirrorUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'video/mp4',
+        'Content-Type': contentType,
         'Content-Length': String(bytes.length),
         'Content-Disposition': `attachment; filename="${filename}"`,
         ...(taskId ? { 'X-Relay-Task-Id': String(taskId) } : {}),
+        ...(partIndex >= 1 ? { 'X-Relay-Part-Index': String(partIndex) } : {}),
         ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
       },
       body: bytes,

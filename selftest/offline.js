@@ -357,18 +357,26 @@ async function scenario(name, opts, check) {
   });
 
   // ---- 场景 9：Nano Banana 生图（2026-09-23 接入）----
-  // 同一 backend、按 agent.model_key 分流；直链交付（不做 mirror），4 张全进 output_variants。
-  await scenario('场景 9 · Nano Banana 生图直链交付', { mode: 'mirror', imageTask: true }, ({ seen, result, log }) => {
+  // 同一 backend、按 agent.model_key 分流；图片必须 mirror 转存（TikTok 图片
+  // CDN 在国内被 DNS 污染，直链交付下游抓不到），4 张逐张上传带分片序号。
+  await scenario('场景 9 · Nano Banana 生图 mirror 转存', { mode: 'mirror', imageTask: true }, ({ seen, result, log }) => {
     ok('回报成功', Boolean(result) && result.ok === true,
       (result ? '成功' : '没有回报') + dumpLogIfFailed(Boolean(result), log));
-    ok('不触发 mirror（图片直链一年有效且无需 Referer，下游自己抓）',
-      seen.mirrors.length === 0, `mirror ${seen.mirrors.length} 次`);
+    ok('4 张图逐张调用了收件端', seen.mirrors.length === 4, `mirror ${seen.mirrors.length} 次`);
+    ok('每张带了分片序号 X-Relay-Part-Index',
+      seen.mirrors.every((m, i) => Number(m.headers['x-relay-part-index']) === i + 1),
+      seen.mirrors.map((m) => m.headers['x-relay-part-index']).join(','));
+    ok('按图片类型提交（image/png，不是 video/mp4）',
+      seen.mirrors.every((m) => m.headers['content-type'] === 'image/png'),
+      String(seen.mirrors[0] && seen.mirrors[0].headers['content-type']));
     ok('output_type 是 image', result && result.output_type === 'image', result && result.output_type);
-    ok('output_url 是第一张图', result && result.output_url === 'https://cdn.example.test/img-1.png',
+    ok('output_url 是收件端返回的站内 URL', result && /site\.example\.test/.test(String(result.output_url)),
       result && result.output_url);
     const v = (result && result.output_variants) || [];
-    ok('4 张图全在 output_variants', Array.isArray(v) && v.length === 4 && v.every((x) => /^https:\/\/cdn\.example\.test\/img-/.test(x.url)),
-      JSON.stringify(v).slice(0, 120));
+    ok('4 张全在 output_variants 且带 direct_url 备份',
+      Array.isArray(v) && v.length === 4 && v.every((x) => x.archived === true && /^https:\/\/cdn\.example\.test\/img-/.test(x.direct_url)),
+      JSON.stringify(v).slice(0, 160));
+    ok('archived=true', result && result.archived === true);
     ok('remote_task_id 是 TikTok 侧任务号', result && result.remote_task_id === FAKE_RESULT.taskId);
     ok('日志里出现了生图分支', /生图模式|出图/.test(log));
   });

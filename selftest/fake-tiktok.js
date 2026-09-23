@@ -88,6 +88,11 @@ async function download() {
   return Buffer.alloc(size, 7);
 }
 
+/** 生图下载（与真实现同形：回 PNG 尺寸字节）。 */
+async function downloadImage() {
+  return Buffer.alloc(1200000, 9);
+}
+
 // ---------------------------------------------------------------------------
 // 生图（Nano Banana）契约回放 —— 与真实现同形：submitImage 返回期望张数，
 // pollImage 每 tick 走 onTick、第 3 tick 起返回全部直链。
@@ -120,6 +125,6 @@ async function pollImage(_session, _cfg, taskId, expectedDrafts, opts = {}) {
 }
 
 module.exports = {
-  probeSession, submit, poll, download, sleep, selectBest: () => null,
+  probeSession, submit, poll, download, downloadImage, sleep, selectBest: () => null,
   submitImage, pollImage,
 };
