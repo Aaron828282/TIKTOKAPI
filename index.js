@@ -51,7 +51,7 @@ const { cfg, loadSession, hasSession, validate, sessionStatus, sessionOrigin } =
 const { normalizeSession } = require('./lib/session');
 const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, buildImagePayload, clampDuration } = require('./lib/payload');
-const { uploadImage } = require('./lib/upload');
+const { uploadImage, uploadVideo } = require('./lib/upload');
 const sessionruntime = require('./lib/sessionruntime');
 const tiktok = require('./lib/tiktok');
 const failure = require('./lib/failure');
@@ -249,6 +249,10 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
   const backend = task.backend || cfg.sessionBackend;
   const prompt = task.prompt || '';
   const images = (task.image_urls || []).filter(Boolean);
+  // 参考视频（2026-09-23，网站打码链路）：号池把 params.video_urls 带回在
+  // task.video_urls —— 打码+静音后的对标视频直链，上传 TikTok 视频库后作为
+  // R2V 视频参考进生成请求体（mentions type=2）。
+  const videoRefs = (task.video_urls || []).filter(Boolean);
   const duration = clampDuration(task.duration);
   // Nano Banana 生图（2026-09-23 接入）：号池不下发 kind 字段，节点按
   // model_key 认（config.json external_backends.tiktok_r2v 里的 key）。
@@ -259,7 +263,8 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
   log(`  模型 ${task.model_name || spec.model_key}（${modelId}）· ${duration}s · `
     + (isImageJob ? '生图模式（一次多张）· '
       : '')
-    + (images.length ? `${images.length} 张参考图` : '无参考图'));
+    + (images.length ? `${images.length} 张参考图` : '无参考图')
+    + (videoRefs.length ? ` · ${videoRefs.length} 条参考视频` : ''));
 
   // 生图：prompt 必填、参考图可空（实测 images:[] 即纯文生图）。
   // 视频：prompt 与参考图不能同时为空。
@@ -285,10 +290,17 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
       log(`  参考图 ${i + 1}/${images.length}`);
       resolved.push(await uploadImage(sess, cfg, images[i], log));
     }
+    // 参考视频：先传 TikTok 视频库拿 vid/previewUrl，再进 wire（硬失败——
+    // 打码链路的视频传不上去就该让任务失败，而不是悄悄退化成无参考生成）。
+    const videoMeta = [];
+    for (let i = 0; i < videoRefs.length; i += 1) {
+      log(`  参考视频 ${i + 1}/${videoRefs.length}`);
+      videoMeta.push(await uploadVideo(sess, cfg, videoRefs[i], log));
+    }
 
     const payload = isImageJob
       ? buildImagePayload(prompt, resolved, modelId)
-      : buildPayload(prompt, resolved, modelId, duration);
+      : buildPayload(prompt, resolved, modelId, duration, videoMeta);
     await beat('SUBMITTING', 5);
     log(`  提交中（body ${Buffer.byteLength(JSON.stringify(payload))} 字节）…`);
     return {
