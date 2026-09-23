@@ -86,6 +86,38 @@ const state = {
   skips: 0,               // peer 次数（观测用，确认取消检测真的在工作）
 };
 
+// ---------------------------------------------------------------------------
+// 崩溃观测（2026-09-24）：进程若死于未捕获异常，stdout 只留在托管平台面板里、
+// 重启后无处可查 —— 离线反复发作时根因永远成谜。把崩溃堆栈与启动计数持久化到
+// 本地 logs/，并经 /status 远程可见。所有 IO 吞错：观测绝不能反过来弄死进程。
+// ---------------------------------------------------------------------------
+const nodeFs = require('node:fs');
+const nodePath = require('node:path');
+const crashDir = nodePath.join(process.cwd(), 'logs');
+const crashFile = nodePath.join(crashDir, 'crash.log');
+const bootFile = nodePath.join(crashDir, 'boot-count');
+function crashAppend(line) {
+  try {
+    nodeFs.mkdirSync(crashDir, { recursive: true });
+    nodeFs.appendFileSync(crashFile, line + '\n');
+    // 日志封顶：超过 512KB 只留最近一半，避免常年运行无限膨胀。
+    const st = nodeFs.statSync(crashFile);
+    if (st.size > 512 * 1024) {
+      const lines = nodeFs.readFileSync(crashFile, 'utf8').trim().split('\n');
+      nodeFs.writeFileSync(crashFile, lines.slice(Math.floor(lines.length / 2)).join('\n') + '\n');
+    }
+  } catch { /* 观测失败不致命 */ }
+}
+let bootCount = 0;
+let lastCrashLine = '';
+try { bootCount = Number(nodeFs.readFileSync(bootFile, 'utf8').trim()) || 0; } catch { }
+try { nodeFs.mkdirSync(crashDir, { recursive: true }); nodeFs.writeFileSync(bootFile, String(bootCount + 1)); } catch { }
+crashAppend(`[${ts()}] BOOT v${require('./package.json').version} pid=${process.pid} boot#${bootCount + 1} node=${process.version}`);
+try {
+  const tailLines = nodeFs.readFileSync(crashFile, 'utf8').trim().split('\n');
+  lastCrashLine = [...tailLines].reverse().find((line) => line.includes(' CRASH ')) || '';
+} catch { }
+
 /**
  * 会话的两块观测信息 —— **现算**，不做状态缓存。
  *
@@ -178,6 +210,10 @@ const server = http.createServer((req, res) => {
       cancelled: state.cancelled,
       last_task: state.lastTask,
       last_error: state.lastError,
+      // 崩溃观测（2026-09-24）：启动次数与最近一次崩溃原因 —— 离线复发时远程即可看根因
+      boot_count: bootCount,
+      last_crash: lastCrashLine || null,
+      mem_rss_mb: Math.round(process.memoryUsage().rss / 1048576),
       });
     } catch (err) {
       json(res, 200, { ok: true, status_error: err.message,
@@ -903,6 +939,19 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('unhandledRejection', (err) => log(`未处理的 Promise 拒绝：${err}`, 'error'));
+// 未捕获异常：落盘崩溃堆栈（重启后 /status 可查根因）再退出，交给托管平台拉起。
+process.on('uncaughtException', (err) => {
+  const detail = String((err && err.stack) || err);
+  crashAppend(`[${ts()}] CRASH uptime=${Math.round((Date.now() - state.startedAt) / 1000)}s running=${state.active.size} ${detail}`);
+  try { process.stderr.write(`[${ts()}] FATAL ${detail}\n`); } catch { }
+  setTimeout(() => process.exit(1), 250).unref();
+});
+// 低频心跳：内存与在跑任务数进 stdout，抓 OOM 趋势（离线复发时先看是不是内存顶到托管上限）。
+setInterval(() => {
+  const m = process.memoryUsage();
+  log(`heartbeat mem rss=${Math.round(m.rss / 1048576)}MB heap=${Math.round(m.heapUsed / 1048576)}MB `
+    + `uptime=${Math.round((Date.now() - state.startedAt) / 1000)}s running=${state.active.size}`);
+}, 5 * 60_000).unref();
 
 log(`tiktok-exec-node v${require('./package.json').version} · Node ${process.version} · `
   + `主机 ${require('node:os').hostname()}`);
