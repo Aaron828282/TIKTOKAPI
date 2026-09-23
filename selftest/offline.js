@@ -42,6 +42,17 @@ const TASK = {
   agent: { provider: 'tiktok_r2v', model_id: '2000012', model_key: 'seedance2_fast' },
 };
 
+/** 生图任务：同一 backend，节点按 agent.model_key 认出 Nano Banana 分支。 */
+const IMAGE_TASK = {
+  task_id: 'selftest-task-0001',
+  backend: 'tiktok_r2v',
+  prompt: 'A cozy coffee shop corner by a window, 9:16 vertical',
+  image_urls: [],
+  model_name: 'Nano Banana 生图',
+  duration: 0,
+  agent: { provider: 'tiktok_r2v', model_id: 'gemini', model_key: 'nano_banana' },
+};
+
 /** 上游假实现返回的「出片结果」，两条变体用于验证分辨率阶梯不被压掉。 */
 const FAKE_RESULT = {
   taskId: 'TIKTOK-SIDE-999',
@@ -95,7 +106,7 @@ function startFakePool(scenario) {
       if (p === '/api/v1/agent/claim') {
         seen.claims += 1;
         // 只给一次活，之后空转 —— 免得自测里反复领到同一个任务
-        return send(200, seen.claims === 1 ? { task: TASK } : { task: null });
+        return send(200, seen.claims === 1 ? { task: scenario.imageTask ? IMAGE_TASK : TASK } : { task: null });
       }
       if (p === '/api/v1/agent/session/lease') {
         const b = JSON.parse(body.toString() || '{}');
@@ -148,13 +159,14 @@ function startFakePool(scenario) {
 // ---------------------------------------------------------------------------
 // 起一个真的 index.js 子进程，上游用假的
 // ---------------------------------------------------------------------------
-function startNode({ poolPort, childPort, mode, oversize, noMirrorUrl, upstreamFail }) {
+function startNode({ poolPort, childPort, mode, oversize, noMirrorUrl, upstreamFail, image }) {
   const env = Object.assign({}, process.env, {
     RH_SELFTEST_RESULT: Buffer.from(JSON.stringify(FAKE_RESULT)).toString('base64'),
     RH_SELFTEST_OVERSIZE: oversize ? '1' : '',
     // 让假上游在轮询阶段直接抛「上游终态拒绝」，用来验失败分类的回报契约。
     RH_SELFTEST_UPSTREAM_FAIL: upstreamFail
       ? Buffer.from(JSON.stringify(upstreamFail)).toString('base64') : '',
+    RH_SELFTEST_IMAGE: image ? '1' : '',
     RH_POOL_URL: `http://127.0.0.1:${poolPort}`,
     RH_AGENT_TOKEN: 'selftest-token',
     RH_AGENT_ID: 'selftest-node',
@@ -202,6 +214,7 @@ async function scenario(name, opts, check) {
     oversize: opts.oversize,
     noMirrorUrl: opts.noMirrorUrl,
     upstreamFail: opts.upstreamFail,
+    image: opts.imageTask,
   });
   try {
     const got = await waitFor(() => (seen.results.length ? seen.results[0] : null), 25000);
@@ -341,6 +354,23 @@ async function scenario(name, opts, check) {
     ok('legacy 路径不还槽（没有租约就没有 release）', seen.releases.length === 0,
       `release ${seen.releases.length} 次`);
     ok('日志里说了回落', /账号池为空|legacy/.test(log));
+  });
+
+  // ---- 场景 9：Nano Banana 生图（2026-09-23 接入）----
+  // 同一 backend、按 agent.model_key 分流；直链交付（不做 mirror），4 张全进 output_variants。
+  await scenario('场景 9 · Nano Banana 生图直链交付', { mode: 'mirror', imageTask: true }, ({ seen, result, log }) => {
+    ok('回报成功', Boolean(result) && result.ok === true,
+      (result ? '成功' : '没有回报') + dumpLogIfFailed(Boolean(result), log));
+    ok('不触发 mirror（图片直链一年有效且无需 Referer，下游自己抓）',
+      seen.mirrors.length === 0, `mirror ${seen.mirrors.length} 次`);
+    ok('output_type 是 image', result && result.output_type === 'image', result && result.output_type);
+    ok('output_url 是第一张图', result && result.output_url === 'https://cdn.example.test/img-1.png',
+      result && result.output_url);
+    const v = (result && result.output_variants) || [];
+    ok('4 张图全在 output_variants', Array.isArray(v) && v.length === 4 && v.every((x) => /^https:\/\/cdn\.example\.test\/img-/.test(x.url)),
+      JSON.stringify(v).slice(0, 120));
+    ok('remote_task_id 是 TikTok 侧任务号', result && result.remote_task_id === FAKE_RESULT.taskId);
+    ok('日志里出现了生图分支', /生图模式|出图/.test(log));
   });
 
   console.log('\n' + '='.repeat(70));

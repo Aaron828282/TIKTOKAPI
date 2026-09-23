@@ -50,7 +50,7 @@ const http = require('node:http');
 const { cfg, loadSession, hasSession, validate, sessionStatus, sessionOrigin } = require('./lib/config');
 const { normalizeSession } = require('./lib/session');
 const { createClient, PoolError } = require('./lib/pool');
-const { buildPayload, clampDuration } = require('./lib/payload');
+const { buildPayload, buildImagePayload, clampDuration } = require('./lib/payload');
 const { uploadImage } = require('./lib/upload');
 const sessionruntime = require('./lib/sessionruntime');
 const tiktok = require('./lib/tiktok');
@@ -250,15 +250,22 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
   const prompt = task.prompt || '';
   const images = (task.image_urls || []).filter(Boolean);
   const duration = clampDuration(task.duration);
+  // Nano Banana 生图（2026-09-23 接入）：号池不下发 kind 字段，节点按
+  // model_key 认（config.json external_backends.tiktok_r2v 里的 key）。
+  // 与视频共用同一 backend / 账号池 / 槽位 —— 差异只在提交路径与结果形态。
+  const isImageJob = String(spec.kind || '') === 'i2i_image'
+    || String(spec.model_key || '').toLowerCase() === 'nano_banana';
 
   log(`  模型 ${task.model_name || spec.model_key}（${modelId}）· ${duration}s · `
-    + (images.length ? `${images.length} 张参考图` : '无参考图（纯文生视频）'));
+    + (isImageJob ? '生图模式（一次多张）· '
+      : '')
+    + (images.length ? `${images.length} 张参考图` : '无参考图'));
 
-  // 参考图可空（纯文生视频，2026-09-21 用户需求 + payload.js 协议注释：上游接受空
-  // images 数组）；prompt 与参考图**不能同时为空**，否则上游无从生成。
-  if (!prompt.trim() && !images.length) {
+  // 生图：prompt 必填、参考图可空（实测 images:[] 即纯文生图）。
+  // 视频：prompt 与参考图不能同时为空。
+  if (isImageJob ? !prompt.trim() : (!prompt.trim() && !images.length)) {
     return failure.localFailure(failure.KIND.PARAM,
-      '提示词与参考图不能同时为空：至少填写提示词，或上传参考图');
+      isImageJob ? '生图任务提示词不能为空' : '提示词与参考图不能同时为空：至少填写提示词，或上传参考图');
   }
 
   // ---- 参考图 + 提交 ----
@@ -279,10 +286,17 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
       resolved.push(await uploadImage(sess, cfg, images[i], log));
     }
 
-    const payload = buildPayload(prompt, resolved, modelId, duration);
+    const payload = isImageJob
+      ? buildImagePayload(prompt, resolved, modelId)
+      : buildPayload(prompt, resolved, modelId, duration);
     await beat('SUBMITTING', 5);
     log(`  提交中（body ${Buffer.byteLength(JSON.stringify(payload))} 字节）…`);
-    return { submitted: await tiktok.submit(sess, cfg, payload, log), session: sess };
+    return {
+      submitted: isImageJob
+        ? await tiktok.submitImage(sess, cfg, payload, log)
+        : await tiktok.submit(sess, cfg, payload, log),
+      session: sess,
+    };
   };
 
   // legacy：唯一允许的会话失效重试点（强刷全局凭据后重试一次，此时上游未建单，安全）。
@@ -309,33 +323,43 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
   let peeking = false;
   let lastPeek = 0;
 
+  // 轮询 onTick：心跳 + 取消检测，生图与视频共用一套（peek 逻辑见下）。
+  const imageOrVideoTick = () => (progress) => {
+    // 轮询期间给号池打心跳（号池按 agent_timeout 给任务收尸，心跳停不得）
+    beat('AGENT_RUNNING', progress);
+
+    if (cfg.peekSeconds > 0 && !peeking && Date.now() - lastPeek >= cfg.peekSeconds * 1000) {
+      lastPeek = Date.now();
+      peeking = true;
+      client.peek(task.task_id)
+        .then((r) => {
+          state.skips += 1;
+          if (r && r.cancelled) {
+            cancelFlag = true;
+            log(`  号池标记该任务不再需要（status=${r.status}）—— 停止轮询`, 'warn');
+          }
+        })
+        .catch((err) => { if (cfg.logLevel === 'debug') log(`  peek 失败：${err.message}`, 'debug'); })
+        .finally(() => { peeking = false; });
+    }
+    return cancelFlag ? { stop: true } : null;
+  };
+
   let result;
   try {
-    result = await tiktok.poll(pollSession, cfg, submitted.taskId, {
-      timeoutMs: cfg.jobTimeoutSeconds * 1000,
-      intervalMs: 8000,
-      log,
-      onTick: (progress) => {
-        // 轮询期间给号池打心跳（号池按 agent_timeout 给任务收尸，心跳停不得）
-        beat('AGENT_RUNNING', progress);
-
-        if (cfg.peekSeconds > 0 && !peeking && Date.now() - lastPeek >= cfg.peekSeconds * 1000) {
-          lastPeek = Date.now();
-          peeking = true;
-          client.peek(task.task_id)
-            .then((r) => {
-              state.skips += 1;
-              if (r && r.cancelled) {
-                cancelFlag = true;
-                log(`  号池标记该任务不再需要（status=${r.status}）—— 停止轮询`, 'warn');
-              }
-            })
-            .catch((err) => { if (cfg.logLevel === 'debug') log(`  peek 失败：${err.message}`, 'debug'); })
-            .finally(() => { peeking = false; });
-        }
-        return cancelFlag ? { stop: true } : null;
-      },
-    });
+    result = await (isImageJob
+      ? tiktok.pollImage(pollSession, cfg, submitted.taskId, submitted.expectedDrafts, {
+        timeoutMs: cfg.jobTimeoutSeconds * 1000,
+        intervalMs: 6000,
+        log,
+        onTick: imageOrVideoTick(),
+      })
+      : tiktok.poll(pollSession, cfg, submitted.taskId, {
+        timeoutMs: cfg.jobTimeoutSeconds * 1000,
+        intervalMs: 8000,
+        log,
+        onTick: imageOrVideoTick(),
+      }));
   } catch (err) {
     // 🔴 无论哪种失败，先把**上游任务号**挂上再往外抛。
     //    能走到这里说明建单已经成功、上游额度已经扣了 —— 失败路径上一旦丢掉
@@ -368,6 +392,30 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
     e.remoteTaskId = err.remoteTaskId;
     e.upstreamCode = err.upstreamCode;
     throw e;
+  }
+
+  // ---- 生图交付（与视频分叉）----
+  //
+  // 图片直链与视频不同：`x-expires` 约**一年**（不是小时级），且 CDN 不带
+  // Referer 也 200（2026-09-23 双向实测）。下游网站本来就能直抓 tiktokcdn
+  // （media-hosts 白名单 + Referer 逻辑都在），所以这里**不做 mirror**，
+  // 直接把 N 条直链回报上去 —— 第一条进 output_url，全部进 output_variants。
+  if (isImageJob) {
+    const urls = result.urls || [];
+    log(`  出图 ${result.elapsedSec}s · ${urls.length} 张`);
+    return {
+      ok: true,
+      output_url: urls[0] || '',
+      output_type: 'image',
+      output_size: '',
+      expire_time: '',
+      remote_task_id: submitted.taskId,
+      output_variants: urls.map((url) => ({ url })),
+      archived: true,
+      archive_note: 'image-direct-links',
+      // TikTok 侧扣的是账号生图额度，拿不到现金价 —— 记 0，别编一个数
+      fee: 0,
+    };
   }
 
   const meta = result.bestMeta || {};

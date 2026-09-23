@@ -88,4 +88,38 @@ async function download() {
   return Buffer.alloc(size, 7);
 }
 
-module.exports = { probeSession, submit, poll, download, sleep, selectBest: () => null };
+// ---------------------------------------------------------------------------
+// 生图（Nano Banana）契约回放 —— 与真实现同形：submitImage 返回期望张数，
+// pollImage 每 tick 走 onTick、第 3 tick 起返回全部直链。
+// ---------------------------------------------------------------------------
+const IMAGE_URLS = ['https://cdn.example.test/img-1.png', 'https://cdn.example.test/img-2.png',
+  'https://cdn.example.test/img-3.png', 'https://cdn.example.test/img-4.png'];
+
+async function submitImage() {
+  return { taskId: RESULT.taskId, expectedDrafts: IMAGE_URLS.length, draftIds: [], raw: {} };
+}
+
+async function pollImage(_session, _cfg, taskId, expectedDrafts, opts = {}) {
+  const { onTick = null, intervalMs = 6000, log = null } = opts;
+  const step = Math.min(intervalMs, 50);
+  for (let i = 0; i < 400; i += 1) {
+    ticks += 1;
+    if (onTick) {
+      const verdict = onTick(Math.min(95, 5 + ticks));
+      if (verdict && verdict.stop) {
+        const err = new Error('任务已被调用方取消（号池侧已进终态）');
+        err.cancelled = true;
+        throw err;
+      }
+    }
+    await sleep(step);
+    if (ticks >= 3) break;
+  }
+  if (log) log(`  [fake] 出图（${ticks} tick · ${expectedDrafts} 张）`);
+  return { taskId, urls: IMAGE_URLS.slice(0, expectedDrafts), draftIds: [], elapsedSec: 12, raw: [] };
+}
+
+module.exports = {
+  probeSession, submit, poll, download, sleep, selectBest: () => null,
+  submitImage, pollImage,
+};
