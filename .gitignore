@@ -41,3 +41,13 @@ logs/
 # Python 参考实现的缓存（reference/sigv4.py 本身要保留，它是移植的依据）
 __pycache__/
 *.pyc
+
+# AI Studio 抓包实验产物（含真实 cookie，绝对不进库）
+selftest/aistudio-acct2.json
+selftest/aistudio-capture.json
+selftest/aistudio-capture.res
+selftest/aistudio-capture.html
+selftest/aistudio-capture.png
+selftest/aistudio-capture-after3s.png
+selftest/aistudio-capture.urls
+selftest/.capture-profile/
