@@ -575,6 +575,18 @@ async function executeTask(task, session, beat, { lease = false, accountId = nul
 // ---------------------------------------------------------------------------
 const aistudioPool = new aistudio.AistudioPool(cfg, log);
 
+// profile 残留对账（每 10 分钟）：控制台删了账号，磁盘 profile 也要跟着走。
+// 拉清单失败就跳过本轮（宁留勿删）；清单里没有、内存里也没挂着的 profile 才清。
+if (cfg.aistudioEnabled) {
+  const reconcile = async () => {
+    try {
+      const r = await client.listAccounts('aistudio_image');
+      await aistudioPool.reconcileProfiles((r.accounts || []).map((a) => a.id));
+    } catch { /* 拉不到清单就不动本地 */ }
+  };
+  setInterval(reconcile, 10 * 60_000).unref();
+}
+
 async function executeAistudio(task, session, beat, { lease = false, accountId = null } = {}) {
   const prompt = String(task.prompt || '').trim();
   if (!prompt) {
