@@ -585,14 +585,43 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
       'AI Studio 生图必须走账号租约执行（号池账号池为空，未配置 Google 账号）');
   }
 
+  // 参考图：可选 0~4 张（0 张 = 纯文生图）。号池侧图片已在自家存储，
+  // 节点逐张抓到临时文件，页面内用 setInputFiles 喂给上传控件。
+  // 上限 4 是 UI 契约（控制台已限制）；节点侧再截一道，防外部调用方绕过。
+  const refUrls = (task.image_urls || []).filter(Boolean).slice(0, 4);
+  const aspect = String(task.aspect_ratio || '').trim();
+  let imagePaths = [];
+  if (refUrls.length) {
+    const nodeOs = require('node:os');
+    const dir = nodePath.join(nodeOs.tmpdir(), `aistudio-${task.task_id}`);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    await beat('UPLOADING', 3);
+    for (let i = 0; i < refUrls.length; i += 1) {
+      const url = refUrls[i];
+      const ext = (/\.(png|jpe?g|webp)(?:\?|$)/i.exec(url) || [, 'jpg'])[1].replace('jpeg', 'jpg');
+      const file = nodePath.join(dir, `ref-${i + 1}.${ext.toLowerCase()}`);
+      log(`  [ai#${accountId}] 参考图 ${i + 1}/${refUrls.length} 下载中…`);
+      const res = await fetch(url);
+      if (!res.ok) {
+        nodeFs.rmSync(dir, { recursive: true, force: true });
+        return failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+          `参考图 ${i + 1} 下载失败：HTTP ${res.status}（${url.slice(0, 80)}）`);
+      }
+      nodeFs.writeFileSync(file, Buffer.from(await res.arrayBuffer()));
+      imagePaths.push(file);
+    }
+  }
+
   const cookieStr = (session && session.cookie) || '';
   const acct = aistudioPool.get(accountId, cookieStr);
 
   await beat('AGENT_RUNNING', 5);
-  log(`  [ai#${accountId}] 提交页面生成：prompt=${prompt.slice(0, 50)}…`);
+  log(`  [ai#${accountId}] 提交页面生成：prompt=${prompt.slice(0, 50)}…`
+    + (imagePaths.length ? ` · ${imagePaths.length} 张参考图` : ' · 纯文生图')
+    + (aspect ? ` · ${aspect}` : ''));
   let images;
   try {
-    images = await acct.generate({ prompt });
+    images = await acct.generate({ prompt, imagePaths, aspect });
   } catch (err) {
     // cookie 失效要让号池看见（控制台标红 + 换号重试）。AuthExpiredError 带
     // upstreamCode=10001106，runTask 的 failover 会认出并走换号路径。
@@ -600,6 +629,11 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
       log(`  [ai#${accountId}] Google cookie 失效：${err.message}`, 'warn');
     }
     throw err;
+  } finally {
+    // 临时参考图无论成败都清掉：托管平台磁盘不可靠，别留垃圾
+    if (imagePaths.length) {
+      try { nodeFs.rmSync(nodePath.dirname(imagePaths[0]), { recursive: true, force: true }); } catch { /* 幂等 */ }
+    }
   }
 
   // 响应含 预览图 + 4K 成图 —— 交付最大的那张（用户口径：1 次调用 = 1 张 4K）
