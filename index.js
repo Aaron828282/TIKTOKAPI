@@ -582,7 +582,8 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
     // legacy 回落（账号池为空时借用全局会话）对 AI Studio 没有意义：
     // 没有账号 id 就没有 profile 目录与额度归属。fail fast 让号池把原因记下来。
     return failure.localFailure(failure.KIND.PARAM,
-      'AI Studio 生图必须走账号租约执行（号池账号池为空，未配置 Google 账号）');
+      lease ? 'AI Studio 生图缺少账号 id（节点内部漏传 accountId，属节点版本 bug，请更新节点）'
+            : 'AI Studio 生图必须走账号租约执行（号池账号池为空，未配置 Google 账号）');
   }
 
   // 参考图：可选 0~4 张（0 张 = 纯文生图）。号池侧图片已在自家存储，
@@ -952,7 +953,9 @@ async function runTask(task, workerId) {
   // ---- 执行（lease 模式提交阶段失效会换号重试一次） ----
   const failover = async () => {
     try {
-      return await executeTask(task, session, beat, { lease });
+      // accountId 必须显式传：aistudio 执行面靠它定位 profile 目录与额度归属
+      // （2026-09-26 首单失败根因 —— 租到号却没把 id 带进执行函数，防呆拦下）。
+      return await executeTask(task, session, beat, { lease, accountId: account && account.id });
     } catch (err) {
       // 只有「提交阶段会话失效且上游未建单」才值得换号重试 ——
       // 带着 remoteTaskId 说明单已建、钱已花，换号重提等于第二单。
@@ -980,7 +983,7 @@ async function runTask(task, workerId) {
       account = { id: r2.account.id, label: r2.account.label || '' };
       active.account = account.label || `#${account.id}`;
       log(`[${workerId}] 已换到账号 ${active.account}，重试提交（此时上游未建单，安全）`, 'info');
-      return executeTask(task, session, beat, { lease: true });
+      return executeTask(task, session, beat, { lease: true, accountId: account.id });
     }
   };
 
