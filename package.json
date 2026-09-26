@@ -1,8 +1,8 @@
 {
   "name": "tiktok-exec-node",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "海外执行节点：替 api号池 执行 TikTok Creative Studio R2V 任务（无浏览器、零依赖）",
+  "description": "海外执行节点：替 api号池 执行 TikTok Creative Studio R2V 任务（无浏览器、零依赖）+ AI Studio 生图（Playwright，可选）",
   "main": "index.js",
   "engines": {
     "node": ">=18"
@@ -14,9 +14,13 @@
     "selftest:failure": "node selftest/failure.js",
     "selftest:session": "node selftest/session.js",
     "selftest:sessionpool": "node selftest/sessionpool.js",
+    "selftest:chromium": "node selftest/chromium-smoke.js",
     "session:from-curl": "node tools/from-curl.js",
-    "session:check": "node preflight.js --session-only"
+    "session:check": "node preflight.js --session-only",
+    "postinstall": "node tools/install-chromium.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "playwright": "^1.48.0"
+  },
   "license": "UNLICENSED"
 }
