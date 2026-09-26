@@ -215,6 +215,8 @@ const server = http.createServer((req, res) => {
       boot_count: bootCount,
       last_crash: lastCrashLine || null,
       mem_rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      // 生图执行面观测（2026-09-26 OOM 排查）：账号 boot 状态与最近错误远程可见
+      aistudio: aistudioPool.status(),
       });
     } catch (err) {
       json(res, 200, { ok: true, status_error: err.message,
@@ -746,6 +748,26 @@ async function report(taskId, payload) {
 // ---------------------------------------------------------------------------
 let stopping = false;
 
+// 孤儿单认尸（2026-09-26）：进程被托管平台杀掉重启（Hostinger Web Apps 上
+// aistudio 首日 OOM 实锤：boot_count 涨、crash.log 无记录=外部击杀）后，内存里
+// 的任务全成孤儿 —— 号池状态永远停在「生成中」直到 30 分钟超时。启动时向号池
+// 取「本 agent 心跳停滞的执行中任务」清单，逐条回报失败；result 幂等，重复安全。
+async function reapOrphans() {
+  try {
+    const r = await client.orphans(cfg.agentId, 90);
+    const ids = (r && r.tasks) || [];
+    if (!ids.length) return;
+    log(`发现 ${ids.length} 条孤儿任务（进程在执行期间被重启），逐条回报失败`, 'warn');
+    for (const tid of ids) {
+      await report(tid, failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+        '节点进程在执行期间被托管平台重启（疑似内存不足），任务成孤儿单 —— 请重新提交；'
+        + '生图执行器如反复出现此错误需迁移到独立 VPS'));
+    }
+  } catch (err) {
+    log(`孤儿单查询失败（下次启动重试）：${err.message}`, 'warn');
+  }
+}
+
 async function loop() {
   // ---- 启动自检 0：配置 ----
   // 先把「缺什么、会以什么形式坏掉」一次说全。这台机器上可观测性有限
@@ -776,6 +798,10 @@ async function loop() {
     }
     // 不退出：号池侧可能还在配置中。平台会把我们拉起来，保持监听并重试更稳。
   }
+
+  // ---- 启动自检 1.5：孤儿单认尸 ----
+  // 必须在开始 claim 之前做：先把上一世的失败交代清楚，再领新活。
+  await reapOrphans();
 
   // ---- 启动自检 2：会话凭据 —— 先向号池取，再验活 ----
   //
