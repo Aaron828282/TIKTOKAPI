@@ -48,13 +48,14 @@
 const http = require('node:http');
 
 const { cfg, loadSession, hasSession, validate, sessionStatus, sessionOrigin } = require('./lib/config');
-const { normalizeSession } = require('./lib/session');
+const { normalizeSession, normalizeAiSession } = require('./lib/session');
 const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, buildImagePayload, clampDuration } = require('./lib/payload');
 const { uploadImage, uploadVideo } = require('./lib/upload');
 const sessionruntime = require('./lib/sessionruntime');
 const tiktok = require('./lib/tiktok');
 const failure = require('./lib/failure');
+const aistudio = require('./lib/aistudio');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const MIN_LEVEL = LEVELS[cfg.logLevel] || LEVELS.info;
@@ -272,7 +273,16 @@ function makeBeater(taskId, active) {
 // ---------------------------------------------------------------------------
 // 单个任务的执行
 // ---------------------------------------------------------------------------
-async function executeTask(task, session, beat, { lease = false } = {}) {
+async function executeTask(task, session, beat, { lease = false, accountId = null } = {}) {
+  const backend = task.backend || cfg.sessionBackend;
+
+  // AI Studio 生图（backend=aistudio_image）：完全不同的执行面 ——
+  // Playwright 常驻会话内 UI 提交（令牌绑定提示词，必须页面现签），
+  // 与 TikTok 的「直连 + 轮询」没有可复用的提交/轮询代码，整体分流。
+  if (backend === 'aistudio_image') {
+    return executeAistudio(task, session, beat, { lease, accountId });
+  }
+
   const spec = task.agent || {};
   const modelId = String(spec.model_id || '');
   if (!modelId) {
@@ -282,7 +292,6 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
       `任务 ${task.task_id} 没带 agent.model_id，无法执行`);
   }
 
-  const backend = task.backend || cfg.sessionBackend;
   const prompt = task.prompt || '';
   const images = (task.image_urls || []).filter(Boolean);
   // 参考视频（2026-09-23，网站打码链路）：号池把 params.video_urls 带回在
@@ -555,6 +564,75 @@ async function executeTask(task, session, beat, { lease = false } = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// AI Studio 生图执行（backend=aistudio_image）
+//
+// 执行面 = Playwright 常驻会话（每账号一个持久 profile + 至多 aistudioTabs 个
+// 工作页）。令牌绑定提示词 ⟹ 页面现签；令牌不绑配置 ⟹ 拦截器在途改写 4K。
+// 产物是原始字节（无上游 URL），交付复用 mirror 通道换站内稳定 URL。
+// ---------------------------------------------------------------------------
+const aistudioPool = new aistudio.AistudioPool(cfg, log);
+
+async function executeAistudio(task, session, beat, { lease = false, accountId = null } = {}) {
+  const prompt = String(task.prompt || '').trim();
+  if (!prompt) {
+    return failure.localFailure(failure.KIND.PARAM, '生图任务提示词不能为空');
+  }
+  if (!lease || !accountId) {
+    // legacy 回落（账号池为空时借用全局会话）对 AI Studio 没有意义：
+    // 没有账号 id 就没有 profile 目录与额度归属。fail fast 让号池把原因记下来。
+    return failure.localFailure(failure.KIND.PARAM,
+      'AI Studio 生图必须走账号租约执行（号池账号池为空，未配置 Google 账号）');
+  }
+
+  const cookieStr = (session && session.cookie) || '';
+  const acct = aistudioPool.get(accountId, cookieStr);
+
+  await beat('AGENT_RUNNING', 5);
+  log(`  [ai#${accountId}] 提交页面生成：prompt=${prompt.slice(0, 50)}…`);
+  let images;
+  try {
+    images = await acct.generate({ prompt });
+  } catch (err) {
+    // cookie 失效要让号池看见（控制台标红 + 换号重试）。AuthExpiredError 带
+    // upstreamCode=10001106，runTask 的 failover 会认出并走换号路径。
+    if (err.authExpired) {
+      log(`  [ai#${accountId}] Google cookie 失效：${err.message}`, 'warn');
+    }
+    throw err;
+  }
+
+  // 响应含 预览图 + 4K 成图 —— 交付最大的那张（用户口径：1 次调用 = 1 张 4K）
+  const best = images.slice().sort((a, b) => b.base64.length - a.base64.length)[0];
+  const bytes = Buffer.from(best.base64, 'base64');
+  log(`  [ai#${accountId}] 出图 ${images.length} 张，取最大 ${(bytes.length / 1048576).toFixed(2)}MB 转存…`);
+
+  await beat('UPLOADING', 92);
+  const ext = /png/i.test(best.contentType) ? 'png' : 'jpg';
+  // 与视频同理：mirror 未配置时降级等于成品丢失（字节在本地内存里没有 URL 可给），
+  // 所以这里对 mirror 失败**不降级**，直接报错 —— fail closed。
+  if (!cfg.mirrorUrl) {
+    return failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+      '图已生成但 RH_MIRROR_URL 未配置，成品无处转存 —— 请在节点环境补齐交付端点');
+  }
+  const outputUrl = await mirror(bytes, `${task.task_id}.${ext}`, task.task_id, {
+    contentType: best.contentType,
+  });
+  log(`  [ai#${accountId}] 已转存 → ${outputUrl.slice(0, 100)}`);
+
+  return {
+    ok: true,
+    output_url: outputUrl,
+    output_type: 'image',
+    output_size: String(bytes.length),
+    archived: true,
+    archive_note: '',
+    // 生图无上游远端任务号（同步 RPC），别编 —— 留空
+    remote_task_id: '',
+    fee: 0,
+  };
+}
+
 /**
  * 把成片字节交给下游换一个稳定 URL（`RH_OUTPUT_MODE=mirror`）。
  *
@@ -794,7 +872,10 @@ async function runTask(task, workerId) {
       }
       if (r && r.ok && r.session) {
         try {
-          session = normalizeSession(r.session);
+          // AI Studio 的 Google cookie 不带 device_id/x_csrftoken —— 按后端分档校验
+          session = backend === 'aistudio_image'
+            ? normalizeAiSession(r.session)
+            : normalizeSession(r.session);
         } catch (err) {
           log(`[${workerId}] 租到的账号凭据结构不对（${err.message}）—— 放弃执行`, 'error');
           await report(tid, failure.localFailure(failure.KIND.PARAM,
@@ -858,7 +939,9 @@ async function runTask(task, workerId) {
       } catch (e3) { log(`[${workerId}] 换号租约失败：${e3.message}`, 'warn'); }
       if (!(r2 && r2.ok && r2.session)) throw err;
       try {
-        session = normalizeSession(r2.session);
+        session = backend === 'aistudio_image'
+          ? normalizeAiSession(r2.session)
+          : normalizeSession(r2.session);
       } catch (e4) { throw err; }
       account = { id: r2.account.id, label: r2.account.label || '' };
       active.account = account.label || `#${account.id}`;
@@ -931,6 +1014,7 @@ function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   sessionruntime.stop();
+  aistudioPool.stop().catch(() => {});
   log(`收到 ${signal}，停止取活并退出 …`);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
