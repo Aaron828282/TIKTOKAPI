@@ -20,6 +20,7 @@
     "postinstall": "node tools/install-chromium.js"
   },
   "dependencies": {
+    "imapflow": "^1.0.191",
     "playwright": "^1.48.0"
   },
   "license": "UNLICENSED"
