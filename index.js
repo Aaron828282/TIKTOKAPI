@@ -615,8 +615,9 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
     }
   }
 
-  const cookieStr = (session && session.cookie) || '';
-  const acct = aistudioPool.get(accountId, cookieStr);
+  // session 是 normalizeAiSession 产物：cookie 型或 google_login 型（执行面
+  // 自登录 + 持久 profile 自持）。整包传给 Pool，凭据签名变了会自动热更。
+  const acct = aistudioPool.get(accountId, session);
 
   await beat('AGENT_RUNNING', 5);
   log(`  [ai#${accountId}] 提交页面生成：prompt=${prompt.slice(0, 50)}…`
