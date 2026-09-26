@@ -105,19 +105,42 @@ async function hasLiveSession(context) {
       return;
     }
 
-    // 自动走前两步：进登录页 → 填邮箱 → 填密码。之后全部交给真人。
-    const signinUrl = 'https://accounts.google.com/v3/signin/identifier?continue='
-      + encodeURIComponent('https://aistudio.google.com/') + '&flowName=GlifWebSignIn&hl=en';
-    await page.goto(signinUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await page.waitForSelector('input[type="email"]', { timeout: 45_000, state: 'visible' });
-    await page.fill('input[type="email"]', String(sess.email || ''));
-    await page.click('#identifierNext').catch(() => {});
-    log('邮箱已提交 —— 等密码页…');
-    await page.waitForSelector('input[type="password"]:visible', { timeout: 45_000 });
-    await page.fill('input[type="password"]', String(sess.password || ''));
-    await page.click('#passwordNext').catch(() => {});
-    log('密码已提交。★★ 从现在起请由你在 noVNC 里亲手完成剩余验证 ★★');
-    log('（手机提示点「是」/ 短信码 / Authenticator 码，任由 Google 给什么你点什么）');
+    // 自动填充（任何一步失败都不关浏览器：转纯手动模式，用户在 noVNC
+    // 里自己走完全程，下面统一盯登录信号）
+    try {
+      await page.goto('https://aistudio.google.com/', {
+        waitUntil: 'domcontentloaded', timeout: 60_000,
+      }).catch(() => {});
+      await page.waitForTimeout(4_000);
+      const goSignin = async () => {
+        const btn = await page.$('a:has-text("Get started"), a:has-text("Sign in")');
+        if (btn) {
+          await btn.click().catch(() => {});
+          await page.waitForTimeout(5_000);
+        }
+        if (!(await page.$('input[type="email"]'))) {
+          await page.goto('https://accounts.google.com/v3/signin/identifier?continue='
+            + encodeURIComponent('https://aistudio.google.com/')
+            + '&flowName=GlifWebSignIn&hl=en', {
+            waitUntil: 'domcontentloaded', timeout: 60_000,
+          }).catch(() => {});
+          await page.waitForTimeout(4_000);
+        }
+      };
+      await goSignin();
+      await page.waitForSelector('input[type="email"]', { timeout: 45_000, state: 'visible' });
+      await page.fill('input[type="email"]', String(sess.email || ''));
+      await page.click('#identifierNext').catch(() => {});
+      log('邮箱已提交 —— 等密码页…');
+      await page.waitForSelector('input[type="password"]:visible', { timeout: 45_000 });
+      await page.fill('input[type="password"]', String(sess.password || ''));
+      await page.click('#passwordNext').catch(() => {});
+      log('密码已提交。★★ 从现在起请由你在 noVNC 里亲手完成剩余验证 ★★');
+      log('（手机提示点「是」/ Authenticator 码 / 短信码，任由 Google 给什么你点什么）');
+    } catch (e) {
+      log(`自动填充未走通（${String(e.message).slice(0, 120)}）—— `
+        + '请你在 noVNC 画面里手动完成整个登录');
+    }
 
     // 只盯结果：profile 里出现 SID+SAPISID 即成功，最多等 25 分钟
     const deadline = Date.now() + 25 * 60_000;
