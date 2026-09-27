@@ -605,6 +605,8 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
   // 上限 4 是 UI 契约（控制台已限制）；节点侧再截一道，防外部调用方绕过。
   const refUrls = (task.image_urls || []).filter(Boolean).slice(0, 4);
   const aspect = String(task.aspect_ratio || '').trim();
+  // 生图分辨率档（1K/2K/4K）：网站按档计费（1K=9 / 4K=10 星点），空 = 节点默认 4K。
+  const imageRes = String(task.image_resolution || '').trim().toUpperCase();
   let imagePaths = [];
   if (refUrls.length) {
     const nodeOs = require('node:os');
@@ -631,13 +633,33 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
   // 自登录 + 持久 profile 自持）。整包传给 Pool，凭据签名变了会自动热更。
   const acct = aistudioPool.get(accountId, session);
 
+  // 🔴 tab 满不判失败、排队等槽（2026-09-27）：此前先领单后抢 tab，抢不到直接
+  // localFailure —— 并发略超 tab 数就整单失败退款，网站侧 10 并发需求必踩。
+  // 现在领单后先等空闲 tab（每 5s 心跳续命 + 轮询），等 20 分钟仍无槽才认失败
+  //（生图实测 ~1-2 分钟/单，20 分钟 = 队列里压 10+ 单也能消化）。
+  const tabDeadline = Date.now() + 20 * 60 * 1000;
+  let queuedLogged = false;
+  while (!acct.hasFreeTab()) {
+    if (Date.now() > tabDeadline) {
+      return failure.localFailure(failure.KIND.QUOTA,
+        `生图通道繁忙：账号 #${accountId} 的 tab 持续占满（已排队 ${Math.round((Date.now() - (tabDeadline - 20 * 60 * 1000)) / 1000)}s），请稍后重试`);
+    }
+    if (!queuedLogged) {
+      log(`  [ai#${accountId}] tab 全忙，任务排队等待空闲槽位（最长 20 分钟）…`);
+      queuedLogged = true;
+    }
+    await beat('AGENT_RUNNING', 5);
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+
   await beat('AGENT_RUNNING', 5);
   log(`  [ai#${accountId}] 提交页面生成：prompt=${prompt.slice(0, 50)}…`
     + (imagePaths.length ? ` · ${imagePaths.length} 张参考图` : ' · 纯文生图')
-    + (aspect ? ` · ${aspect}` : ''));
+    + (aspect ? ` · ${aspect}` : '')
+    + (imageRes ? ` · ${imageRes}` : ''));
   let images;
   try {
-    images = await acct.generate({ prompt, imagePaths, aspect });
+    images = await acct.generate({ prompt, imagePaths, aspect, resolution: imageRes });
   } catch (err) {
     // cookie 失效要让号池看见（控制台标红 + 换号重试）。AuthExpiredError 带
     // upstreamCode=10001106，runTask 的 failover 会认出并走换号路径。
