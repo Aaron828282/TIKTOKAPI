@@ -53,6 +53,7 @@ const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, buildImagePayload, clampDuration } = require('./lib/payload');
 const { uploadImage, uploadVideo } = require('./lib/upload');
 const sessionruntime = require('./lib/sessionruntime');
+const ttautologin = require('./lib/ttautologin');
 const tiktok = require('./lib/tiktok');
 const failure = require('./lib/failure');
 const aistudio = require('./lib/aistudio');
@@ -191,6 +192,8 @@ const server = http.createServer((req, res) => {
       session_origin: sessionOrigin(),
       session_backend: cfg.sessionBackend,
       session_pool: sessionruntime.status(),
+      // TikTok cookie 自动续期（2026-09-28）：检查/登录/清理的最近状态
+      tt_auto_login: ttautologin.status(),
       // 交付路径能不能用 —— 别等出片才发现收件端没配
       output_mode: cfg.outputMode,
       output_ready: cfg.outputMode !== 'mirror' || Boolean(cfg.mirrorUrl),
@@ -722,6 +725,56 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
  * 收件方应校验这个号确实是它自己下过单的任务，**再由它自己决定落点**
  * （别让上传方指定存储路径，否则等于把别人资产的开写权限交出去）。
  */
+/**
+ * OSS 直传通道（2026-09-27）：sign → PUT OSS → commit，三步都不走大流量中转。
+ * 网站侧端点：/api/relay/oss-sign、/api/relay/oss-commit（同一 Bearer 令牌）。
+ * 落点（storage_key）由网站决定，这里只搬运字节 —— 别想着自己拼 key。
+ */
+async function ossDirectDeliver(bytes, taskId, { partIndex = 0, contentType = 'video/mp4' } = {}) {
+  const base = new URL(cfg.mirrorUrl).origin;
+  const signHeaders = {
+    ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
+    'X-Relay-Task-Id': String(taskId),
+    ...(partIndex >= 1 ? { 'X-Relay-Part-Index': String(partIndex) } : {}),
+    'Content-Type': contentType,
+  };
+  const signRes = await fetch(base + '/api/relay/oss-sign', { method: 'POST', headers: signHeaders });
+  const signText = await signRes.text();
+  if (!signRes.ok) throw new Error(`oss-sign HTTP ${signRes.status}：${signText.slice(0, 200)}`);
+  const sign = JSON.parse(signText);
+  if (!sign.upload_url) throw new Error('oss-sign 响应里没有 upload_url');
+
+  // PUT 超时按体积缩放：实测 Hostinger→OSS ~55KB/s，24MB 上限要 445s；
+  // 按 25KB/s 慢速留裕量（+120s 握手/首字节），上限 1800s（任务总超时 5100s 兜底）。
+  const putTimeoutSeconds = Math.min(1800, Math.max(600, Math.ceil(bytes.length / (25 * 1024)) + 120));
+  const putCtrl = new AbortController();
+  const putTimer = setTimeout(() => putCtrl.abort(), putTimeoutSeconds * 1000);
+  let putRes;
+  try {
+    putRes = await fetch(sign.upload_url, {
+      method: 'PUT',
+      headers: { 'Content-Type': sign.content_type },
+      body: bytes,
+      signal: putCtrl.signal,
+    });
+  } catch (err) {
+    throw new Error(`OSS 直传失败：${err.name === 'AbortError' ? `超过 ${putTimeoutSeconds}s 未完成` : err.message}`);
+  } finally {
+    clearTimeout(putTimer);
+  }
+  if (!putRes.ok) throw new Error(`OSS 直传 HTTP ${putRes.status}：${(await putRes.text().catch(() => '')).slice(0, 200)}`);
+
+  const commitRes = await fetch(base + '/api/relay/oss-commit', {
+    method: 'POST',
+    headers: { ...signHeaders, 'X-Relay-Storage-Key': sign.storage_key },
+  });
+  const commitText = await commitRes.text();
+  if (!commitRes.ok) throw new Error(`oss-commit HTTP ${commitRes.status}：${commitText.slice(0, 200)}`);
+  const commit = JSON.parse(commitText);
+  if (!commit.output_url) throw new Error('oss-commit 响应里没有 output_url');
+  return commit.output_url;
+}
+
 async function mirror(bytes, filename, taskId = '', { partIndex = 0, contentType = 'video/mp4' } = {}) {
   const maxBytes = cfg.mirrorMaxMb * 1024 * 1024;
   if (bytes.length > maxBytes) {
@@ -729,6 +782,18 @@ async function mirror(bytes, filename, taskId = '', { partIndex = 0, contentType
     throw new Error(`成片 ${(bytes.length / 1048576).toFixed(2)}MB 超过收件端上限 `
       + `${cfg.mirrorMaxMb}MB —— 收件端有体积闸门（网站侧 25MB），`
       + '调 RH_MIRROR_MAX_MB 前先确认对方也放开了');
+  }
+
+  // 大文件优先 OSS 直传（跨境中转 ~15KB/s，9MB 必超时）；失败自动回落中转。
+  if (cfg.ossDirect && bytes.length >= cfg.ossDirectMinMb * 1024 * 1024) {
+    try {
+      log(`  OSS 直传（${(bytes.length / 1048576).toFixed(2)}MB ≥ ${cfg.ossDirectMinMb}MB）…`);
+      const url = await ossDirectDeliver(bytes, taskId, { partIndex, contentType });
+      log('  OSS 直传完成');
+      return url;
+    } catch (err) {
+      log(`  OSS 直传失败（${err.message}）—— 回落网站中转`);
+    }
   }
 
   const ctrl = new AbortController();
@@ -844,6 +909,18 @@ async function loop() {
   // 顺序很重要：**先取**。凭据的持有者是号池，本地环境变量只是兜底，
   // 所以「本地没配」在 auto/pool 模式下不是问题，「号池也没有」才是。
   const sr = await sessionruntime.start(client, log);
+
+  // ---- 启动自检 3：TikTok cookie 自动续期调度器 ----
+  // 🔴 默认关闭（RH_TT_LOGIN_ENABLED=1 才启用）：机房 IP 登录风控重，
+  // cookie 改由运营者本机登录后从控制台手动粘贴。开关只影响调度器，
+  // 生图执行面（拿号池 cookie 发请求）完全不受影响。
+  if (cfg.ttLoginEnabled) {
+    // 只做调度与对账：该续期时才 spawn 登录子进程（用完即退，内存归还），
+    // 平时连浏览器都不开 —— 生图执行面的内存零打扰。
+    ttautologin.start(client, cfg, log, tiktok);
+  } else {
+    log('[tt-login] 自动续期已停用（RH_TT_LOGIN_ENABLED 未开启）—— cookie 由控制台手动维护');
+  }
 
   if (!hasSession()) {
     if (cfg.sessionSource === 'env') {
@@ -1112,6 +1189,7 @@ function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   sessionruntime.stop();
+  ttautologin.stop();
   aistudioPool.stop().catch(() => {});
   log(`收到 ${signal}，停止取活并退出 …`);
   server.close(() => process.exit(0));
