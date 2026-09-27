@@ -909,6 +909,9 @@ async function loop() {
   // 顺序很重要：**先取**。凭据的持有者是号池，本地环境变量只是兜底，
   // 所以「本地没配」在 auto/pool 模式下不是问题，「号池也没有」才是。
   const sr = await sessionruntime.start(client, log);
+  // 新账号/换 cookie 立即采集看门狗（60s 轻量对账号池清单，不打 TikTok；
+  // 与自动续期开关无关 —— 采集是看板功能，永远开着）
+  sessionruntime.startNewAccountWatcher(client, log);
 
   // ---- 启动自检 3：TikTok cookie 自动续期调度器 ----
   // 🔴 默认关闭（RH_TT_LOGIN_ENABLED=1 才启用）：机房 IP 登录风控重，
@@ -1088,6 +1091,14 @@ async function runTask(task, workerId) {
     return;
   }
 
+  // ---- 任务前积分快照（2026-09-28）：任务一分到账号就采一次 ----
+  // 和任务后快照成对，号池的余额差值归属窗口更紧、按模型分摊更准。
+  // fire-and-forget：采集串行在 infoChain 上，绝不拖住任务执行。
+  if (lease && account && session && !stopping) {
+    sessionruntime.refreshAccountInfo(client, session, account.id, log,
+      { taskId: tid, model: task.model_name, phase: 'pre' }).catch(() => {});
+  }
+
   // ---- 执行（lease 模式提交阶段失效会换号重试一次） ----
   const failover = async () => {
     try {
@@ -1177,8 +1188,8 @@ async function runTask(task, workerId) {
   // 只在 lease 模式（知道账号 id）下做；失败不影响任何结果，见
   // sessionruntime.refreshAccountInfo 的注释。fire-and-forget：别拖住下一个任务。
   if (lease && account && session && !stopping) {
-    sessionruntime.refreshAccountInfo(client, session, account.id, log)
-      .catch(() => {});
+    sessionruntime.refreshAccountInfo(client, session, account.id, log,
+      { taskId: tid, model: task.model_name, phase: 'post' }).catch(() => {});
   }
   state.active.delete(tid);
   state.presence = state.active.size ? 'busy' : 'idle';
