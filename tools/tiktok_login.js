@@ -182,6 +182,144 @@ function fetchOtpCode(log) {
   });
 }
 
+// ---------------------------------------------------------------- 形状验证码求解
+
+/**
+ * 「点选两个相同形状」验证码求解（2026-09-28 接入，本机真图实测通过）。
+ *
+ * 链路：检测 widget → 截图验证码图 → 子进程跑 Python 求解器（CV，零打码
+ * 平台成本）→ 归一化坐标 → **人类化鼠标轨迹**点击两个物体 → 点 Confirm。
+ * 失败让主循环下一轮重新检测重试（TikTok 会自动换新图）；连续失败超限才
+ * 报人工。验证码可能在 iframe（captcha 域）也可能就地渲染 —— 两种都找。
+ */
+const SOLVER_PY = path.join(__dirname, 'captcha_solver', 'solver.py');
+
+function captchaPython() {
+  if (process.env.RH_CAPTCHA_PY) return process.env.RH_CAPTCHA_PY;
+  const local = path.join(__dirname, 'captcha_solver', 'venv',
+    process.platform === 'win32' ? 'Scripts\\python.exe' : 'bin', 'python');
+  for (const c of [local, '/opt/rhnode/tools/captcha_solver/venv/bin/python']) {
+    try { if (fs.existsSync(c)) return c; } catch { /* 无 */ }
+  }
+  return 'python3';  // 兜底：系统 python（需自行装 opencv-headless + numpy）
+}
+
+/** 在所有 frame 里找形状验证码的图区元素，返回 {frame, el} 或 null。 */
+async function findShapeCaptcha(page) {
+  const frames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
+  for (const frame of frames) {
+    // 候选容器：captcha 专域 iframe 的 body / 主页面里 id|class 带 captcha 的可见块
+    let containers = [];
+    if (/captcha/i.test(frame.url())) {
+      containers = [frame.locator('body')];
+    } else if (frame === page.mainFrame()) {
+      const pageText = (await page.textContent('body').catch(() => '')) || '';
+      if (!/select\s*2|same\s*shape|选择两个|两个相同|形状相同/i.test(pageText)) continue;
+      containers = [
+        frame.locator('[id*="captcha" i]'),
+        frame.locator('[class*="captcha" i]'),
+      ];
+    } else {
+      const ft = (await frame.textContent('body').catch(() => '')) || '';
+      if (!/select\s*2|same\s*shape|选择两个|两个相同|形状相同/i.test(ft)) continue;
+      containers = [frame.locator('body')];
+    }
+    for (const c of containers) {
+      const n = await c.count().catch(() => 0);
+      for (let k = 0; k < Math.min(n, 4); k++) {
+        const box = c.nth(k);
+        if (!(await box.isVisible().catch(() => false))) continue;
+        const bb = await box.boundingBox().catch(() => null);
+        if (!bb || bb.width < 150 || bb.height < 100) continue;
+        // 优先容器内的 img/canvas（更贴近验证码图本体）；没有就用容器整体
+        let el = null;
+        for (const sel of ['img', 'canvas', 'div[style*="background-image"]']) {
+          const inner = box.locator(sel).first();
+          if (await inner.isVisible().catch(() => false)) { el = inner; break; }
+        }
+        el = el || box;
+        return { frame, el };
+      }
+    }
+  }
+  return null;
+}
+
+/** 跑一次求解并人类化点击。返回 true = 已点完 Confirm（成败由主循环判定）。 */
+async function solveShapeCaptchaOnce(cap, page, log) {
+  const SHOT_TMP = path.join(SHOTS, `captcha-${Date.now()}.png`);
+  fs.mkdirSync(SHOTS, { recursive: true });
+  await cap.el.screenshot({ path: SHOT_TMP });
+  // 子进程求解：stdout 最后一行 JSON。20s 超时强杀 —— 求解器卡死不能拖垮登录。
+  const result = await new Promise((resolve) => {
+    const py = spawn(captchaPython(), [SOLVER_PY, SHOT_TMP]);
+    let so = '';
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; try { py.kill('SIGKILL'); } catch { /* */ } resolve(r); } };
+    setTimeout(() => finish(null), 20_000);
+    py.stdout.on('data', (c) => { so += c; });
+    py.on('error', (e) => { log(`求解器启动失败（${captchaPython()}）：${e.message}`); finish(null); });
+    py.on('close', () => {
+      const lines = so.trim().split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (line.startsWith('{')) {
+          try { return finish(JSON.parse(line)); } catch { /* 不是这行 */ }
+        }
+      }
+      finish(null);
+    });
+  });
+  try { fs.unlinkSync(SHOT_TMP); } catch { /* 留着也行 */ }
+  if (!result || !result.ok || !Array.isArray(result.points) || result.points.length !== 2) {
+    log(`求解失败：${result && result.reason ? result.reason : '无输出/超时'}`);
+    return false;
+  }
+  const bb = await cap.el.boundingBox().catch(() => null);
+  if (!bb) { log('验证码图区 boundingBox 拿不到（可能已消失）'); return false; }
+
+  // 人类化点击：缓动 + 抖动 + 变速，两击之间随机停顿。坐标 = 截图区
+  // boundingBox × 归一化比例（与截图分辨率/DPR 无关）。
+  const humanClick = async (relX, relY) => {
+    const tx = bb.x + bb.width * relX;
+    const ty = bb.y + bb.height * relY;
+    let sx = tx + (Math.random() * 240 - 120);
+    let sy = ty + (Math.random() * 180 - 90);
+    await page.mouse.move(sx, sy);
+    const steps = 12 + Math.floor(Math.random() * 10);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const ease = 1 - Math.pow(1 - t, 3);
+      sx = tx + (sx - tx) * (1 - ease);
+      sy = ty + (sy - ty) * (1 - ease);
+      await page.mouse.move(
+        sx + (Math.random() - 0.5) * 3 * (1 - t),
+        sy + (Math.random() - 0.5) * 3 * (1 - t));
+      await sleep(12 + Math.random() * 26);
+    }
+    await sleep(80 + Math.random() * 180);
+    await page.mouse.down();
+    await sleep(45 + Math.random() * 70);
+    await page.mouse.up();
+  };
+  const p = result.points;
+  log(`求解成功（score=${result.score}）：点击 (${p[0].rel_x},${p[0].rel_y}) / (${p[1].rel_x},${p[1].rel_y})`);
+  await humanClick(p[0].rel_x, p[0].rel_y);
+  await sleep(350 + Math.random() * 500);
+  await humanClick(p[1].rel_x, p[1].rel_y);
+  await sleep(500 + Math.random() * 600);
+  // Confirm：优先在验证码所在 frame 里找按钮；找不到就用主页面（就地渲染形态）
+  const confirmSel = ['button:has-text("Confirm")', 'button:has-text("确认")',
+    '[class*="submit" i] button', 'button:has-text("Verify")'];
+  for (const sel of confirmSel) {
+    try {
+      const btn = cap.frame.locator(sel).first();
+      if (await btn.isVisible().catch(() => false)) { await btn.click(); break; }
+    } catch { /* 下一个 */ }
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------- 登录状态机
 
 (async () => {
@@ -210,6 +348,7 @@ function fetchOtpCode(log) {
     await shot(page, 'entry');
 
     let otpUsed = false;       // 一次运行最多收一次码（防止连续触发风控）
+    let captchaTries = 0;      // 形状验证码已尝试次数（连续失败超限报人工）
     const deadline = Date.now() + 5 * 60_000;
     let step = 0;
 
@@ -267,6 +406,13 @@ function fetchOtpCode(log) {
         || await page.locator('input[autocomplete="one-time-code"]').count() > 0
         || await page.locator('input[inputmode="numeric"]').count() >= 4;
       if (needOtp) {
+        if (!EMAIL_PASS) {
+          // 有时登录只弹形状验证码、不弹邮箱验证码（2026-09-28 实测）——
+          // 所以邮箱密码是可选材料；但 OTP 真弹出来而没有它，只能明确失败。
+          await shot(page, 'otp-no-pass');
+          OUT({ ok: false, stage: 'otp',
+            error: '弹出邮箱验证码但控制台未配置邮箱密码（接不了码）', _rc: 1 });
+        }
         // 先点「发送验证码」（如果页面要求手动触发）
         await clickFirst(page, [
           'button:has-text("Send code")', 'div:has-text("Send code")',
@@ -320,11 +466,29 @@ function fetchOtpCode(log) {
         continue;
       }
 
-      // ---- 滑块/拼图：自动化扛不住，交人工 ----
-      if (/captcha|slider|puzzle|滑[块动]/i.test(pageText.slice(0, 4000))) {
-        await shot(page, 'captcha');
+      // ---- 挑战：形状验证码（「点选两个相同物体」—— 实测几乎每次密码
+      // 提交后都会弹，2026-09-28 起自动求解，不再交人工）----
+      // 滑块/拼图类仍自动化扛不住：识别出滑块特征就维持人工退出。
+      const capWidget = await findShapeCaptcha(page);
+      if (capWidget) {
+        captchaTries++;
+        if (captchaTries > 6) {
+          await shot(page, 'captcha-exhausted');
+          OUT({ ok: false, stage: 'captcha',
+            error: `形状验证码连续 ${captchaTries - 1} 次未通过，需人工处理`, _rc: 2 });
+        }
+        log(`检测到形状验证码（第 ${captchaTries} 次尝试）…`);
+        await shot(page, 'captcha-before');
+        await solveShapeCaptchaOnce(capWidget, page, log);
+        // 点完等判定：通过 → widget 消失走主循环；失败 → TikTok 换新图，下轮重试
+        await page.waitForTimeout(4000);
+        await shot(page, 'captcha-after');
+        continue;
+      }
+      if (/slider|puzzle|拖[动移]|滑[块动]/i.test(pageText.slice(0, 4000))) {
+        await shot(page, 'captcha-slider');
         OUT({ ok: false, stage: 'captcha',
-          error: '遇到人机挑战（滑块/拼图），需要人工处理后重跑', _rc: 2 });
+          error: '遇到滑块/拼图挑战，自动化扛不住，需人工处理后重跑', _rc: 2 });
       }
 
       // ---- 邮箱框：默认登录页就是 Email 标签；⚠️ 邮箱+密码是**同页一个

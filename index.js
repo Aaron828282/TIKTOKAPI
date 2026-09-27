@@ -910,13 +910,21 @@ async function loop() {
   // 所以「本地没配」在 auto/pool 模式下不是问题，「号池也没有」才是。
   const sr = await sessionruntime.start(client, log);
   // 新账号/换 cookie 立即采集看门狗（60s 轻量对账号池清单，不打 TikTok；
-  // 与自动续期开关无关 —— 采集是看板功能，永远开着）
-  sessionruntime.startNewAccountWatcher(client, log);
+  // 与自动续期开关无关 —— 采集是看板功能，永远开着）。
+  // 自动续期启用时挂 kick 回调：控制台刚配完登录材料/点了立即续期，
+  // ≤60s 内触发一次登录检查（版本变化即通知，不用等 ttLoginCheckSeconds）。
+  sessionruntime.startNewAccountWatcher(client, log, 60,
+    cfg.ttLoginEnabled
+      ? () => {
+          log('[watch] 凭据变化 → 立即触发自动续期检查');
+          ttautologin.kick(client, cfg, log, tiktok);
+        }
+      : null);
 
   // ---- 启动自检 3：TikTok cookie 自动续期调度器 ----
-  // 🔴 默认关闭（RH_TT_LOGIN_ENABLED=1 才启用）：机房 IP 登录风控重，
-  // cookie 改由运营者本机登录后从控制台手动粘贴。开关只影响调度器，
-  // 生图执行面（拿号池 cookie 发请求）完全不受影响。
+  // 2026-09-28 恢复启用（RH_TT_LOGIN_ENABLED=1）：登录挑战以「点选两个相同
+  // 形状」验证码为主，已接入 CV 求解器（tools/captcha_solver/），OTP 出现才接码。
+  // 开关只影响调度器，生图执行面（拿号池 cookie 发请求）完全不受影响。
   if (cfg.ttLoginEnabled) {
     // 只做调度与对账：该续期时才 spawn 登录子进程（用完即退，内存归还），
     // 平时连浏览器都不开 —— 生图执行面的内存零打扰。
