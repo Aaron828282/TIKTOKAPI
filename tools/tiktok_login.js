@@ -106,6 +106,27 @@ if (!EMAIL || !TT_PASS) {
   OUT({ ok: false, stage: 'config', error: '缺 email 或 tiktok_pass' });
 }
 
+// ---- BFF 指纹捕获：登录后的页面流量里，`x-fp-id` 在请求头、`device_id` 在
+// ---- URL 查询串。号池回填时显式带上（login-refresh 支持），让新会话绑定
+// ---- 该 profile 真实的设备注册结果，而不是留空。
+const bffFp = { x_fp_id: '', device_id: '' };
+function watchBffFp(page) {
+  page.on('request', (req) => {
+    try {
+      const u = req.url();
+      if (!/ads\.tiktok\.com/.test(u)) return;
+      if (!bffFp.x_fp_id) {
+        const h = req.headers()['x-fp-id'];
+        if (h) bffFp.x_fp_id = h;
+      }
+      if (!bffFp.device_id) {
+        const m = u.match(/[\?&](?:device_id|did)=(\d{10,25})/);
+        if (m) bffFp.device_id = m[1];
+      }
+    } catch { /* 尽力而为 */ }
+  });
+}
+
 // ---------------------------------------------------------------- 小工具
 
 let shotN = 0;
@@ -334,15 +355,19 @@ async function solveShapeCaptchaOnce(cap, page, log) {
   });
   let page = ctx.pages()[0] || (await ctx.newPage());
   await spoofPage(ctx, page);
+  watchBffFp(page);
   // 登录流可能弹新窗口（OAuth 子域等），新 page 一律先伪装再干活
-  ctx.on('page', (p) => spoofPage(ctx, p).catch(() => {}));
+  ctx.on('page', (p) => { spoofPage(ctx, p).catch(() => {}); watchBffFp(p); });
 
   try {
     // ⚠️ 直连登录页，**不走落地页**：落地页的 Log in 按钮点击行为不稳定
     // （有时弹菜单不导航），而且从落地页点进登录页后 SPA 长时间白屏
     // （实测 5 分钟不渲染）；直连 /i18n/login 则 10s 内表单可用。
-    // 已登录的 profile 访问登录页会被重定向回 business 主站 —— 正好当出口判定。
-    await page.goto('https://ads.tiktok.com/i18n/login', {
+    // 🔴 必须带 redirect=creativestudio/create 参数（2026-09-28 用户指正）：
+    // 裸 /i18n/login 登录后落点不对，拿不到 Symphony Creative Studio 会话。
+    // 已登录的 profile 访问登录页会被重定向回主站 —— 正好当出口判定。
+    await page.goto('https://ads.tiktok.com/i18n/login?redirect='
+      + encodeURIComponent('https://ads.tiktok.com/creative/creativestudio/create'), {
       waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForTimeout(6000);
     await shot(page, 'entry');
@@ -377,7 +402,8 @@ async function solveShapeCaptchaOnce(cap, page, log) {
         if (!cookieStr.includes('sessionid_ads=')) {
           OUT({ ok: false, stage: 'cookie', error: '登录页面成功但 cookie 里没有 sessionid_ads', _rc: 1 });
         }
-        OUT({ ok: true, stage: 'done', cookie: cookieStr, user_agent: ua });
+        OUT({ ok: true, stage: 'done', cookie: cookieStr, user_agent: ua,
+          x_fp_id: bffFp.x_fp_id, device_id: bffFp.device_id });
       }
 
       if (!onLogin) {
