@@ -92,11 +92,11 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       if (/login\.live\.com/.test(page.url())) break;
     }
     await page.waitForSelector('div[role="option"]', { timeout: 45000 });
-    // 3) 找最新一封 TikTok 邮件 —— ⚠️ 新码邮件常有 10~30s 延迟，而收件箱里
-    //    躺着上一轮的旧码邮件。直接抓会拿到过期码（2026-09-28 实测被拒）。
-    //    策略：轮询等「新邮件」（列表相对时间 ≤4 分钟），~90s 后放弃等待、
-    //    退而取最新一封（总预算 180s 内）。
-    const readInbox = () => page.$$eval('div[role="option"]', els => els.map(e => ({
+    // 3) 找最新一封 TikTok 验证码邮件 —— 三级查找（2026-09-28 no-code 教训）：
+    //    ① 焦点收件箱：轮询等 ≤4min 新邮件，~90s 后认命取最新
+    //    ② 「其他」收件箱：Outlook 常把陌生发件人分到 Other
+    //    ③ 垃圾邮件文件夹：新 Outlook 账号 TikTok 邮件高发进 Junk
+    const readList = () => page.$$eval('div[role="option"]', els => els.map(e => ({
       label: e.getAttribute('aria-label') || '', text: (e.innerText || '').slice(0, 160),
     })));
     const ageMinutes = (s) => {
@@ -106,31 +106,69 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       if (mm) return parseInt(mm[1], 10);
       return 999; // 钟点时间/Yesterday/日期 = 判不了或旧
     };
-    let hitIdx = -1, waitedPolls = 0;
-    for (let poll = 0; poll < 9; poll++) {
-      const items = await readInbox();
-      hitIdx = items.findIndex(it => /tiktok/i.test(it.label + ' ' + it.text));
-      if (hitIdx >= 0) {
-        const age = ageMinutes(items[hitIdx].label + ' ' + items[hitIdx].text);
-        if (age <= 4 || poll >= 6) break;   // 够新，或等太久认命用最新的
-      }
-      waitedPolls = poll + 1;
-      await page.waitForTimeout(12000);
+    const isCodeMail = (s) => /verif|code|验证/i.test(s);
+    let pickAge = 999;
+    const pickMail = async () => {
+      const items = await readList().catch(() => []);
+      let best = -1, bestScore = -1;
+      items.forEach((it, i) => {
+        const hay = it.label + ' ' + it.text;
+        if (!/tiktok/i.test(hay)) return;
+        const age = ageMinutes(hay);
+        const score = (age <= 4 ? 2 : 0) + (isCodeMail(hay) ? 1 : 0);
+        if (score > bestScore) { bestScore = score; best = i; pickAge = age; }
+      });
+      return best;
+    };
+    const waitList = async (ms) => {
+      await page.waitForTimeout(ms);
       await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
       await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+    };
+    let hitIdx = -1;
+    // —— ① 焦点收件箱 ——
+    for (let poll = 0; poll < 9; poll++) {
+      hitIdx = await pickMail();
+      if (hitIdx >= 0 && (pickAge <= 4 || poll >= 6)) break;
+      hitIdx = -1;
+      await waitList(12000);
     }
+    // —— ② 「其他」收件箱 ——
     if (hitIdx < 0) {
-      const items = await readInbox().catch(() => []);
-      return out({ ok: false, stage: 'no-tiktok-mail', inbox_first3: items.slice(0, 3), _rc: 1 });
+      await page.getByRole('button', { name: /other|其他/i }).first()
+        .click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+      await page.waitForSelector('div[role="option"]', { timeout: 15000 }).catch(() => {});
+      for (let poll = 0; poll < 2; poll++) {
+        hitIdx = await pickMail();
+        if (hitIdx >= 0) break;
+        await page.waitForTimeout(10000);
+      }
     }
-    await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
+    // —— ③ 垃圾邮件文件夹 ——
+    if (hitIdx < 0) {
+      await page.goto('https://outlook.live.com/mail/0/junkemail', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+      for (let poll = 0; poll < 4; poll++) {
+        hitIdx = await pickMail();
+        if (hitIdx >= 0) break;
+        await waitList(10000);
+      }
+    }
+await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
     await page.waitForTimeout(3000);
     // 4) 读正文抓 6 位码
     const body = await page.evaluate(() => {
       const m = document.querySelector('div[role="main"]');
       return (m ? m.innerText : document.body.innerText).slice(0, 4000);
     });
-    const m = body.match(/\b([A-Z0-9]{6})\b/);
+    let m = body.match(/\b([A-Z0-9]{6})\b/);
+    if (!m) {
+      // 兜底：从列表项预览文本抓码（预览常含验证码数字）
+      const items2 = await readList().catch(() => []);
+      const hay2 = items2[hitIdx] ? (items2[hitIdx].label + ' ' + items2[hitIdx].text) : '';
+      m = hay2.match(/\b([A-Z0-9]{6})\b/);
+    }
     const subj = (body.split('\n').find(l => /verification|code/i.test(l)) || '').slice(0, 80);
     if (!m) {
       const f = await shot('nocode');
