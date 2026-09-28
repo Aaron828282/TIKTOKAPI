@@ -157,7 +157,7 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       }
     }
     // —— ②.5 全局搜索（跨所有文件夹精确捞 TikTok 发件人，含 Other/Junk）——
-    //    发件人固定为 TikTok for billionaires，搜 "TikTok" 必中
+    //    发件人固定为 TikTok For Business，搜 "TikTok" 必中
     if (hitIdx < 0) {
       const box = page.locator('input[type="search"], input[aria-label*="earch" i], #topSearchInput').first();
       await box.click({ timeout: 3000 }).catch(() => {});
