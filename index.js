@@ -608,7 +608,9 @@ if (cfg.gensparkEnabled) {
     try {
       const r = await client.listAccounts('genspark_image');
       for (const acc of (r.accounts || [])) {
-        if (acc.status !== 'active') continue;
+        // 🔴 2026-09-29 修复：这里原来有 `acc.status !== 'active' 就跳过` ——
+        // 但 /agent/accounts 端点根本不下发 status 字段（服务端已只挑 active），
+        // 恒 undefined ≠ 'active' ⟹ 巡检对每个账号都静默跳过，上线以来一直空转。
         // 整包 session 传入（登录型 creds 没有 cookie，只传 cookie 会误判失效）
         const acct = gensparkPool.get(acc.id, normalizeGsSession(acc.session || {}));
         try {
@@ -748,8 +750,9 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
       const tag = `${backend === 'genspark_image' ? 'gs' : 'ai'}#${fresh.map((a) => a.id).join(',')}`;
       log(`[watch] 检测到新账号/新凭据（${backend}）：${tag} —— 30s 内立即验证`);
       for (const acc of fresh) {
-        if (acc.status !== 'active') continue;
-        verifyChain = verifyChain.then(() => verifyNow(backend, acc)).catch(() => {});
+        // 注意：/agent/accounts 不下发 status（服务端已只挑 active），别按 status 过滤。
+        verifyChain = verifyChain.then(() => verifyNow(backend, acc))
+          .catch((err) => log(`[watch] ${tag} 立即验证内部异常：${err.message}`, 'warn'));
       }
     }
   };
