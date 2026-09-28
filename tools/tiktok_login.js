@@ -183,7 +183,7 @@ function fetchOtpCode(log) {
     let stdout = '';
     let done = false;
     const finish = (r) => { if (!done) { done = true; resolve(r); } };
-    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } finish(null); }, 180_000);
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } finish(null); }, 300_000);  // 三级查箱（焦点/Other/Junk）需要 5min 预算
     child.stdout.on('data', (c) => { stdout += c; });
     child.on('error', (e) => { log(`接码器启动失败：${e.message}`); finish(null); });
     child.on('close', () => {
