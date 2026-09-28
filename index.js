@@ -48,7 +48,7 @@
 const http = require('node:http');
 
 const { cfg, loadSession, hasSession, validate, sessionStatus, sessionOrigin } = require('./lib/config');
-const { normalizeSession, normalizeAiSession } = require('./lib/session');
+const { normalizeSession, normalizeAiSession, normalizeGsSession } = require('./lib/session');
 const { createClient, PoolError } = require('./lib/pool');
 const { buildPayload, buildImagePayload, clampDuration } = require('./lib/payload');
 const { uploadImage, uploadVideo } = require('./lib/upload');
@@ -602,14 +602,15 @@ if (cfg.gensparkEnabled) {
 
   // Genspark 会员档/额度巡检（每 6 小时，免费只读 GET /api/user）：
   //   · plan != plus → 号池自动停用（agent_gateway 按 plan 判定）
-  //   · 401/403     → 账号验活失败（控制台标红，提示换 cookie）
+  //   · 401/403     → 账号验活失败（控制台标红；登录型会先自动重登一次再探）
   //   · 正常        → 刷新 plan + 验活通过；cookie 20 天滑动续期顺手完成
   const gsHealthRound = async () => {
     try {
       const r = await client.listAccounts('genspark_image');
       for (const acc of (r.accounts || [])) {
         if (acc.status !== 'active') continue;
-        const acct = gensparkPool.get(acc.id, (acc.session || {}).cookie || '');
+        // 整包 session 传入（登录型 creds 没有 cookie，只传 cookie 会误判失效）
+        const acct = gensparkPool.get(acc.id, normalizeGsSession(acc.session || {}));
         try {
           const info = await acct.health();
           await client.reportAccount({
@@ -786,8 +787,10 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
       lease ? 'Genspark 生图缺少账号 id（节点内部漏传 accountId，属节点版本 bug，请更新节点）'
             : 'Genspark 生图必须走账号租约执行（号池账号池为空，未配置 Genspark cookie）');
   }
-  const cookie = String((session || {}).cookie || '');
-  const acct = gensparkPool.get(accountId, cookie);
+  // 凭据两种形态（2026-09-29）：cookie 型（session_id）/ genspark_login 型
+  // （邮箱+密码，执行面自登录 + profile 自持，失效自动重登）。整包传给
+  // Pool，凭据签名变了会自动热更。
+  const acct = gensparkPool.get(accountId, normalizeGsSession(session));
   // model_id 来自号池 config.external_backends.genspark_image.models（gpt-image-2 / 2.5）
   const model = String((task.agent || {}).model_id || 'gpt-image-2');
   // 分辨率档 1K/2K/4K（号池 params.image_resolution；空 = 1K 免费起步档）
@@ -913,7 +916,7 @@ async function runGensparkTask(task, workerId) {
       // 网站侧任务挂着、用户看着永远排队）；等 sleep_until 到点的除外。
       if (r && !r.ok && r.reason === 'no_account' && r.pool && Number(r.pool.total) === 0) {
         outcome = failure.localFailure(failure.KIND.UPSTREAM_ERROR,
-          'Genspark 账号池为空（未录入任何 cookie）—— 请在控制台 Genspark 页签添加账号后重试');
+          'Genspark 账号池为空（未录入任何账号）—— 请在控制台 Genspark 页签添加账号后重试');
         break;
       }
       log(`[${workerId}] Genspark 账号全忙或休眠，${cfg.pollSeconds}s 后再试`
@@ -930,8 +933,12 @@ async function runGensparkTask(task, workerId) {
     const account = { id: r.account.id, label: r.account.label || '' };
     active.account = account.label || `#${account.id}`;
     tried.push(account.id);
-    const cookie = String((r.session || {}).cookie || '');
-    if (!cookie.includes('session_id=')) {
+    // 凭据两种形态（2026-09-29）：cookie 型认 session_id；genspark_login 型
+    // （邮箱+密码）没有 cookie —— 节点自动登录造会话，不判凭据不完整。
+    const gsSession = r.session || {};
+    const isGsLoginKind = gsSession.kind === 'genspark_login';
+    const gsCookie = String(gsSession.cookie || '');
+    if (!isGsLoginKind && !gsCookie.includes('session_id=')) {
       log(`[${workerId}] 账号 ${active.account} 凭据缺 session_id —— 标记失效并换号`, 'warn');
       await client.reportAccount({
         agent_id: cfg.agentId, account_id: account.id, ok: false,
