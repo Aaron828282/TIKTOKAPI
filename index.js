@@ -621,6 +621,18 @@ if (cfg.gensparkEnabled) {
             plan: info.plan || '',
           });
           log(`  [gs#${acc.id}] 巡检通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
+          // 登录型：巡检触发的自动登录成功后同样回传 cookie（与看门狗同口径；
+          // 回填后 session 变 cookie 型，下轮巡检不再回传 —— 天然终止）。
+          if ((acc.session || {}).kind === 'genspark_login') {
+            const cookie = await acct.getCookieHeader();
+            if (cookie.includes('session_id=')) {
+              await client.loginReport({
+                account_id: acc.id, ok: true, cookie,
+                note: '巡检触发自动登录成功，cookie 已回传',
+              }).then(() => log(`  [gs#${acc.id}] 登录 cookie 已回传号池`))
+                .catch((e) => log(`  [gs#${acc.id}] cookie 回传失败（不影响执行）：${e.message}`, 'warn'));
+            }
+          }
         } catch (err) {
           if (err && err.authExpired) {
             await client.reportAccount({
