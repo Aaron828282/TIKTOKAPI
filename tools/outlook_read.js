@@ -135,10 +135,17 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       hitIdx = -1;
       await waitList(12000);
     }
-    // —— ② 「其他」收件箱 ——
+    // —— ② 「其他」收件箱（Focused/Other 切换，多选择器兜底，防静默失败）——
     if (hitIdx < 0) {
-      await page.getByRole('button', { name: /other|其他/i }).first()
-        .click({ timeout: 3000 }).catch(() => {});
+      const otherSels = [
+        'button:has-text("Other")', '[role="tab"]:has-text("Other")',
+        '[role="option"]:has-text("Other")', 'span:text-is("Other")',
+        'button:has-text("其他")', '[role="tab"]:has-text("其他")',
+      ];
+      for (const sel of otherSels) {
+        const okc = await page.click(sel, { timeout: 1200 }).then(() => true).catch(() => false);
+        if (okc) break;
+      }
       await page.waitForTimeout(3000);
       await page.waitForSelector('div[role="option"]', { timeout: 15000 }).catch(() => {});
       for (let poll = 0; poll < 2; poll++) {
@@ -149,11 +156,28 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
         await page.waitForTimeout(10000);
       }
     }
+    // —— ②.5 全局搜索（跨所有文件夹精确捞 TikTok 发件人，含 Other/Junk）——
+    //    发件人固定为 TikTok for billionaires，搜 "TikTok" 必中
+    if (hitIdx < 0) {
+      const box = page.locator('input[type="search"], input[aria-label*="earch" i], #topSearchInput').first();
+      await box.click({ timeout: 3000 }).catch(() => {});
+      await box.fill('TikTok').catch(() => {});
+      await page.keyboard.press('Enter').catch(() => {});
+      await page.waitForTimeout(5000);
+      await page.waitForSelector('div[role="option"]', { timeout: 15000 }).catch(() => {});
+      for (let poll = 0; poll < 3; poll++) {
+        hitIdx = await pickMail();
+        if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
+        if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
+        hitIdx = -1;
+        await page.waitForTimeout(8000);
+      }
+    }
     // —— ③ 垃圾邮件文件夹 ——
     if (hitIdx < 0) {
       await page.goto('https://outlook.live.com/mail/0/junkemail', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
-      for (let poll = 0; poll < 4; poll++) {
+      for (let poll = 0; poll < 3; poll++) {
         hitIdx = await pickMail();
         if (hitIdx >= 0) break;
         await waitList(10000);
