@@ -636,6 +636,126 @@ if (cfg.gensparkEnabled) {
   setTimeout(gsHealthRound, 90_000).unref();
 }
 
+// ---------------------------------------------------------------------------
+// 新账号/换凭据「立即验证」看门狗（aistudio + genspark，2026-09-29）
+//
+// 用户诉求（对齐 TikTok 的 startNewAccountWatcher 体验）：控制台加完号，
+// 不等 6 小时巡检，≤30s 内节点就应触发登录/验活并把结论写回控制台。
+//
+// 做法：每 30s 拉一次两个生图后端的账号清单（打的是自家号池，几十 KB），
+// 与上次见过的 id→version 对照，新出现/版本变化的账号进入**串行**验证链：
+//   · genspark：health()（登录型会借机自动登录）→ reportAccount 回报结论；
+//     登录型成功后**收割 profile cookie 回传号池**（login-refresh 回填，
+//     version+1，控制台从「等待自动登录」变成真实 cookie + 到期时间）。
+//     回填后 session 变 cookie 型 → 下一轮触发只 reportAccount、不再回传
+//     —— 天然终止，不会形成回传循环。
+//   · aistudio：ensure()（登录型自动登录，profile 自持则秒过）→ 只回报
+//     验证结论，**不回传 cookie** —— Google 会话是环境绑定的（2026-09-27
+//     实锤：导出离开原浏览器几分钟即被 1PSIDTS 轮换作废），回传一份秒死
+//     的 cookie 只会误导控制台；登录态由 profile 常驻自持。
+//
+// 首轮只建目录：节点重启不触发全量验证（genspark 那边 90s 首轮巡检覆盖）。
+// ---------------------------------------------------------------------------
+if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
+  const verifySeen = new Map();          // backend -> Map(id -> version)
+  let verifyChain = Promise.resolve();   // 串行：多个新账号不并发挤爆浏览器
+  const verifyNow = async (backend, acc) => {
+    const id = Number(acc.id);
+    const kind = (acc.session || {}).kind || 'cookie';
+    if (backend === 'genspark_image') {
+      try {
+        const acct = gensparkPool.get(id, normalizeGsSession(acc.session || {}));
+        const info = await acct.health();
+        await client.reportAccount({
+          agent_id: cfg.agentId, account_id: id, ok: true,
+          code: 'GENSPARK_HEALTH',
+          message: `加号即验通过（${info.email || '?'} · plan=${info.plan || '未知'}）`,
+          plan: info.plan || '',
+        });
+        log(`[watch] gs#${id} 立即验证通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
+        // 登录型：收割 cookie 回传号池（cookie 型已有凭据，无需回传）。
+        if (kind === 'genspark_login') {
+          const cookie = await acct.getCookieHeader();
+          if (cookie.includes('session_id=')) {
+            try {
+              const r = await client.loginReport({
+                account_id: id, ok: true, cookie,
+                note: '加号即验：节点自动登录成功，cookie 已回传',
+              });
+              log(`[watch] gs#${id} 登录 cookie 已回传号池`
+                + (r && r.version ? `（v${r.version}）` : ''));
+            } catch (err) {
+              log(`[watch] gs#${id} cookie 回传失败（不影响执行，下轮巡检可再触发）：`
+                + err.message, 'warn');
+            }
+          } else {
+            log(`[watch] gs#${id} 登录成功但 profile 里没收到 session_id —— 跳过回传`, 'warn');
+          }
+        }
+      } catch (err) {
+        const msg = String(err.message).slice(0, 260);
+        // 登录型失败走 login-refresh 的 ok=false 通道（号池记 login_note，
+        // 控制台能看到失败原因）；cookie 型走 reportAccount（标红验活结论）。
+        if (kind === 'genspark_login') {
+          await client.loginReport({
+            account_id: id, ok: false, note: `加号即验失败：${msg}`,
+          }).catch(() => {});
+        } else {
+          await client.reportAccount({
+            agent_id: cfg.agentId, account_id: id, ok: false,
+            code: (err && err.authExpired) ? '10001106' : 'GENSPARK_VERIFY_FAIL',
+            message: msg,
+          }).catch(() => {});
+        }
+        log(`[watch] gs#${id} 立即验证失败：${msg}`, 'warn');
+      }
+      return;
+    }
+    // ---- aistudio_image：只触发登录 + 回报结论，不回传 cookie（环境绑定）----
+    try {
+      const acct = aistudioPool.get(id, normalizeAiSession(acc.session || {}));
+      await acct.ensure();
+      await client.reportAccount({
+        agent_id: cfg.agentId, account_id: id, ok: true,
+        code: 'AISTUDIO_HEALTH', message: '加号即验：登录态就绪（profile 自持）',
+      });
+      log(`[watch] ai#${id} 立即验证通过（登录态就绪）`);
+    } catch (err) {
+      const msg = String(err.message).slice(0, 260);
+      await client.reportAccount({
+        agent_id: cfg.agentId, account_id: id, ok: false,
+        code: (err && err.authExpired) ? '10001106' : 'AISTUDIO_VERIFY_FAIL',
+        message: msg,
+      }).catch(() => {});
+      log(`[watch] ai#${id} 立即验证失败：${msg}`, 'warn');
+    }
+  };
+  const verifyWatch = async () => {
+    for (const [backend, enabled] of [['genspark_image', cfg.gensparkEnabled],
+      ['aistudio_image', cfg.aistudioEnabled]]) {
+      if (!enabled) continue;
+      let list = [];
+      try {
+        const r = await client.listAccounts(backend);
+        list = (r && r.accounts) || [];
+      } catch { continue; }                 // 号池抖动：跳过这轮，下轮对账
+      const now = new Map(list.map((a) => [Number(a.id), Number(a.version) || 0]));
+      const first = !verifySeen.has(backend);
+      const prev = verifySeen.get(backend) || new Map();
+      const fresh = list.filter((a) => prev.get(Number(a.id)) !== (Number(a.version) || 0));
+      verifySeen.set(backend, now);
+      if (first || !fresh.length) continue;  // 首轮建目录；无变化不打扰
+      const tag = `${backend === 'genspark_image' ? 'gs' : 'ai'}#${fresh.map((a) => a.id).join(',')}`;
+      log(`[watch] 检测到新账号/新凭据（${backend}）：${tag} —— 30s 内立即验证`);
+      for (const acc of fresh) {
+        if (acc.status !== 'active') continue;
+        verifyChain = verifyChain.then(() => verifyNow(backend, acc)).catch(() => {});
+      }
+    }
+  };
+  setInterval(() => { verifyWatch().catch(() => {}); }, 30_000).unref();
+}
+
 // profile 残留对账（每 10 分钟）：控制台删了账号，磁盘 profile 也要跟着走。
 // 拉清单失败就跳过本轮（宁留勿删）；清单里没有、内存里也没挂着的 profile 才清。
 if (cfg.aistudioEnabled) {
