@@ -107,7 +107,7 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       return 999; // 钟点时间/Yesterday/日期 = 判不了或旧
     };
     const isCodeMail = (s) => /verif|code|验证/i.test(s);
-    let pickAge = 999;
+    let pickAge = 999, pickScore = 0;
     const pickMail = async () => {
       const items = await readList().catch(() => []);
       let best = -1, bestScore = -1;
@@ -118,6 +118,7 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
         const score = (age <= 4 ? 2 : 0) + (isCodeMail(hay) ? 1 : 0);
         if (score > bestScore) { bestScore = score; best = i; pickAge = age; }
       });
+      pickScore = best >= 0 ? bestScore : 0;
       return best;
     };
     const waitList = async (ms) => {
@@ -125,11 +126,12 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
       await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
     };
-    let hitIdx = -1;
-    // —— ① 焦点收件箱 ——
+    let hitIdx = -1, staleIdx = -1;
+    // —— ① 焦点收件箱（新邮件或带验证码关键词才收；旧欢迎邮件只记兜底）——
     for (let poll = 0; poll < 9; poll++) {
       hitIdx = await pickMail();
-      if (hitIdx >= 0 && (pickAge <= 4 || poll >= 6)) break;
+      if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
+      if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
       hitIdx = -1;
       await waitList(12000);
     }
@@ -141,7 +143,9 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       await page.waitForSelector('div[role="option"]', { timeout: 15000 }).catch(() => {});
       for (let poll = 0; poll < 2; poll++) {
         hitIdx = await pickMail();
-        if (hitIdx >= 0) break;
+        if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
+        if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
+        hitIdx = -1;
         await page.waitForTimeout(10000);
       }
     }
@@ -155,7 +159,12 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
         await waitList(10000);
       }
     }
-await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
+    if (hitIdx < 0 && staleIdx >= 0) hitIdx = staleIdx; // 三级都没等到新邮件，认命用旧 TikTok 邮件
+    if (hitIdx < 0) {
+      const items = await readList().catch(() => []);
+      return out({ ok: false, stage: 'no-tiktok-mail', inbox_first3: items.slice(0, 3), _rc: 1 });
+    }
+    await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
     await page.waitForTimeout(3000);
     // 4) 读正文抓 6 位码
     const body = await page.evaluate(() => {
