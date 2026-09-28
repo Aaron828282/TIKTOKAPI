@@ -128,7 +128,7 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
     };
     let hitIdx = -1, staleIdx = -1;
     // —— ① 焦点收件箱（新邮件或带验证码关键词才收；旧欢迎邮件只记兜底）——
-    for (let poll = 0; poll < 9; poll++) {
+    for (let poll = 0; poll < 4; poll++) {
       hitIdx = await pickMail();
       if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
       if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
