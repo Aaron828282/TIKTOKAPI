@@ -57,6 +57,7 @@ const ttautologin = require('./lib/ttautologin');
 const tiktok = require('./lib/tiktok');
 const failure = require('./lib/failure');
 const aistudio = require('./lib/aistudio');
+const genspark = require('./lib/genspark');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const MIN_LEVEL = LEVELS[cfg.logLevel] || LEVELS.info;
@@ -220,6 +221,7 @@ const server = http.createServer((req, res) => {
       mem_rss_mb: Math.round(process.memoryUsage().rss / 1048576),
       // 生图执行面观测（2026-09-26 OOM 排查）：账号 boot 状态与最近错误远程可见
       aistudio: aistudioPool.status(),
+      genspark: gensparkPool.status(),
       });
     } catch (err) {
       json(res, 200, { ok: true, status_error: err.message,
@@ -286,6 +288,13 @@ async function executeTask(task, session, beat, { lease = false, accountId = nul
   // 与 TikTok 的「直连 + 轮询」没有可复用的提交/轮询代码，整体分流。
   if (backend === 'aistudio_image') {
     return executeAistudio(task, session, beat, { lease, accountId });
+  }
+
+  // Genspark 生图（backend=genspark_image，2026-09-28）：纯 HTTP SSE 执行面。
+  // 正常派单走 runGensparkTask 的多账号 failover 循环；这里只是兜底分流
+  // （比如未来别的调用方直接把任务塞进 executeTask）。
+  if (backend === 'genspark_image') {
+    return executeGenspark(task, session, beat, { lease, accountId });
   }
 
   const spec = task.agent || {};
@@ -577,6 +586,53 @@ async function executeTask(task, session, beat, { lease = false, accountId = nul
 // 产物是原始字节（无上游 URL），交付复用 mirror 通道换站内稳定 URL。
 // ---------------------------------------------------------------------------
 const aistudioPool = new aistudio.AistudioPool(cfg, log);
+const gensparkPool = new genspark.GensparkPool(cfg, log);
+
+// Genspark 账号对账（每 10 分钟）：控制台删了账号，内存执行器也跟着走。
+// 拉清单失败就跳过本轮（宁留勿删）。
+if (cfg.gensparkEnabled) {
+  const gsReconcile = async () => {
+    try {
+      const r = await client.listAccounts('genspark_image');
+      gensparkPool.reconcile((r.accounts || []).map((a) => a.id));
+    } catch { /* 拉不到清单就不动本地 */ }
+  };
+  setInterval(gsReconcile, 10 * 60_000).unref();
+
+  // Genspark 会员档/额度巡检（每 6 小时，免费只读 GET /api/user）：
+  //   · plan != plus → 号池自动停用（agent_gateway 按 plan 判定）
+  //   · 401/403     → 账号验活失败（控制台标红，提示换 cookie）
+  //   · 正常        → 刷新 plan + 验活通过；cookie 20 天滑动续期顺手完成
+  const gsHealthRound = async () => {
+    try {
+      const r = await client.listAccounts('genspark_image');
+      for (const acc of (r.accounts || [])) {
+        if (acc.status !== 'active') continue;
+        const acct = gensparkPool.get(acc.id, (acc.session || {}).cookie || '');
+        try {
+          const info = await acct.health();
+          await client.reportAccount({
+            agent_id: cfg.agentId, account_id: acc.id, ok: true,
+            code: 'GENSPARK_HEALTH', message: `plan=${info.plan || '未知'}`,
+            plan: info.plan || '',
+          });
+          log(`  [gs#${acc.id}] 巡检通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
+        } catch (err) {
+          if (err && err.authExpired) {
+            await client.reportAccount({
+              agent_id: cfg.agentId, account_id: acc.id, ok: false,
+              code: '10001106', message: String(err.message).slice(0, 260),
+            }).catch(() => {});
+          }
+          log(`  [gs#${acc.id}] 巡检失败：${err.message}`, 'warn');
+        }
+      }
+    } catch { /* 号池不可达：下轮再试 */ }
+  };
+  setInterval(gsHealthRound, cfg.gensparkHealthSeconds * 1000).unref();
+  // 启动 90s 后先跑一轮（等首次 listAccounts 可用）
+  setTimeout(gsHealthRound, 90_000).unref();
+}
 
 // profile 残留对账（每 10 分钟）：控制台删了账号，磁盘 profile 也要跟着走。
 // 拉清单失败就跳过本轮（宁留勿删）；清单里没有、内存里也没挂着的 profile 才清。
@@ -706,6 +762,225 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
     remote_task_id: '',
     fee: 0,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Genspark 生图执行（backend=genspark_image，2026-09-28）
+//
+// 执行面 = 纯 HTTP SSE（无浏览器）。凭据 = genspark.ai 登录 cookie；
+// project_id 由执行器凭 cookie 自动创建；出图字节走 mirror 换稳定 URL，
+// 与 aistudio 交付完全同构。额度墙（5h 滚动窗口）抛 QuotaLimitError，
+// 由 runGensparkTask 的多账号 failover 接手。
+// ---------------------------------------------------------------------------
+async function executeGenspark(task, session, beat, { lease = false, accountId = null } = {}) {
+  const prompt = String(task.prompt || '').trim();
+  if (!prompt) {
+    return failure.localFailure(failure.KIND.PARAM, '生图任务提示词不能为空');
+  }
+  if (!lease || !accountId) {
+    return failure.localFailure(failure.KIND.PARAM,
+      lease ? 'Genspark 生图缺少账号 id（节点内部漏传 accountId，属节点版本 bug，请更新节点）'
+            : 'Genspark 生图必须走账号租约执行（号池账号池为空，未配置 Genspark cookie）');
+  }
+  const cookie = String((session || {}).cookie || '');
+  const acct = gensparkPool.get(accountId, cookie);
+  // model_id 来自号池 config.external_backends.genspark_image.models（gpt-image-2 / 2.5）
+  const model = String((task.agent || {}).model_id || 'gpt-image-2');
+  // 分辨率档 1K/2K/4K（号池 params.image_resolution；空 = 1K 免费起步档）
+  const size = String(task.image_resolution || '1K').trim().toUpperCase();
+  const aspect = String(task.aspect_ratio || '1:1').trim();
+
+  await beat('AGENT_RUNNING', 5);
+  log(`  [gs#${accountId}] 提交：${model} · ${size} · ${aspect}`
+    + ` · prompt=${prompt.slice(0, 50)}…`);
+  let out;
+  try {
+    out = await acct.generate({ prompt, model, size, aspect });
+  } catch (err) {
+    acct.lastError = `${err.name || 'Error'}: ${err.message}`.slice(0, 200);
+    // authExpired / quotaLimited 由上层 failover 识别处置；这里只留痕
+    if (err.authExpired) log(`  [gs#${accountId}] cookie 失效：${err.message}`, 'warn');
+    if (err.quotaLimited) log(`  [gs#${accountId}] ${err.message}`, 'warn');
+    throw err;
+  }
+  // 🔴 真实生效参数与请求参数对账（agent 会静默纠偏非法值）——落日志便于记账核查
+  if (out.model !== model || out.size !== size) {
+    log(`  [gs#${accountId}] ⚠ 参数已被上游纠偏：请求 ${model}/${size} → 实际 ${out.model}/${out.size}`, 'warn');
+  }
+
+  await beat('UPLOADING', 92);
+  const isPng = /png/i.test(out.contentType);
+  const ext = isPng ? 'png' : 'jpg';
+  if (!cfg.mirrorUrl) {
+    return failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+      '图已生成但 RH_MIRROR_URL 未配置，成品无处转存 —— 请在节点环境补齐交付端点');
+  }
+  const outputUrl = await mirror(out.bytes, `${task.task_id}.${ext}`, task.task_id, {
+    contentType: out.contentType,
+  });
+  log(`  [gs#${accountId}] 已转存 → ${outputUrl.slice(0, 100)}`);
+
+  return {
+    ok: true,
+    output_url: outputUrl,
+    output_type: 'image',
+    output_size: String(out.bytes.length),
+    archived: true,
+    archive_note: '',
+    remote_task_id: out.taskId || '',
+    // 真实生效的模型/档位（网站记账与展示以此为准，号池透传存进 result_json）
+    result_model: out.model,
+    result_size: out.size,
+    fee: 0,
+  };
+}
+
+/**
+ * Genspark 任务的派单与多账号 failover（用户口径 2026-09-28）：
+ *
+ *   · 每账号 5 槽位（号池 max_slots 记账）；
+ *   · 撞 5h 额度墙 → 账号回报 sleep_until（官方重置点 + 30min），任务**立即**
+ *     转下一个账号的空槽，用户无感；
+ *   · cookie 失效 → 账号标记失效，同样转下一个；
+ *   · 确定性失败（PARAM / 内容审核）直接终态，不烧后续账号；
+ *   · 连续 5 个账号都失败（额度墙/失效/瞬时上游错误）→ 判 FAILED，
+ *     网站侧全额退还星点。
+ */
+async function runGensparkTask(task, workerId) {
+  const tid = task.task_id;
+  const backend = 'genspark_image';
+  state.claims += 1;
+  const active = {
+    taskId: tid, phase: 'claimed', progress: 0,
+    startedAt: Date.now(), worker: workerId, account: '',
+  };
+  state.active.set(tid, active);
+  state.presence = 'busy';
+  const beat = makeBeater(tid, active);
+  log(`[${workerId}] 领到 Genspark 生图任务 ${tid} · ${task.model_name} · `
+    + `${task.image_resolution || '1K'} · prompt=${String(task.prompt || '').slice(0, 40)}…`);
+
+  const MAX_ATTEMPTS = 5;
+  const LEASE_WAIT_MS = 15 * 60 * 1000;
+  const tried = [];
+  let outcome = null;
+  let lastFailureNote = '';
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS && !stopping; attempt += 1) {
+    // ---- 租一个没试过的账号（exclude 已试清单；全忙/休眠时轮询等待） ----
+    let r = null;
+    const leaseDeadline = Date.now() + LEASE_WAIT_MS;
+    for (;;) {
+      try {
+        r = await client.leaseSession({ backend, taskId: tid, exclude: tried });
+      } catch (err) {
+        log(`[${workerId}] 租号请求失败：${err.message}`, 'warn');
+      }
+      if (r && r.ok && r.session) break;
+      if (Date.now() > leaseDeadline) {
+        outcome = failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+          `等待可用 Genspark 账号超时（15 分钟）—— 账号池全忙/休眠/凭据失效；请检查控制台账号状态`);
+        break;
+      }
+      log(`[${workerId}] Genspark 账号全忙或休眠，${cfg.pollSeconds}s 后再试`
+        + `（任务 ${tid} 不判失败，已试 ${tried.length} 个）`, 'warn');
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, cfg.pollSeconds * 1000));
+    }
+    if (outcome) break;
+
+    const account = { id: r.account.id, label: r.account.label || '' };
+    active.account = account.label || `#${account.id}`;
+    tried.push(account.id);
+    const cookie = String((r.session || {}).cookie || '');
+    if (!cookie.includes('session_id=')) {
+      log(`[${workerId}] 账号 ${active.account} 凭据缺 session_id —— 标记失效并换号`, 'warn');
+      await client.reportAccount({
+        agent_id: cfg.agentId, account_id: account.id, ok: false,
+        code: '10001106', message: '凭据缺 session_id（导入不完整）',
+      }).catch(() => {});
+      await client.releaseSession({ taskId: tid, accountId: account.id }).catch(() => {});
+      lastFailureNote = `账号 ${active.account} 凭据不完整`;
+      continue;
+    }
+
+    await beat('AGENT_RUNNING', 5);
+    log(`[${workerId}] 尝试 ${attempt}/${MAX_ATTEMPTS} · 账号 ${active.account}`
+      + `（并发 ${r.account.running}/${r.account.max_slots}）`);
+    let err = null;
+    try {
+      outcome = await executeGenspark(task, r.session, beat, { lease: true, accountId: account.id });
+    } catch (e) { err = e; }
+
+    // ---- 成功：还槽收工 ----
+    if (!err) {
+      await client.releaseSession({ taskId: tid, accountId: account.id }).catch(() => {});
+      state.done += 1;
+      log(`[${workerId}]   ✅ ${String(outcome.output_url || '').slice(0, 110)}`);
+      state.lastTask = { taskId: tid, ok: true, detail: String(outcome.output_url || '').slice(0, 160), kind: '', at: Date.now() };
+      await report(tid, outcome);
+      state.active.delete(tid);
+      state.presence = state.active.size ? 'busy' : 'idle';
+      return;
+    }
+
+    // ---- 失败分拣：额度墙 / cookie 失效 → 换号；确定性失败 → 终态 ----
+    const out = failure.outcomeOf(err);
+    await client.releaseSession({ taskId: tid, accountId: account.id }).catch(() => {});
+    lastFailureNote = `${active.account}: ${String(out.error).slice(0, 160)}`;
+
+    if (err.quotaLimited) {
+      // 官方重置点 + 30min 缓冲 → 账号 sleep_until（status 不动，租约 SQL 到点自动放行）
+      const until = (err.resetTs || Math.floor(Date.now() / 1000)) + cfg.gensparkSleepBufferSeconds;
+      try {
+        await client.reportAccount({
+          agent_id: cfg.agentId, account_id: account.id, ok: false,
+          code: 'GENSPARK_5H_LIMIT', message: String(err.message).slice(0, 260),
+          sleep_until: until,
+        });
+      } catch (e2) { log(`[${workerId}] 休眠回报失败：${e2.message}`, 'warn'); }
+      log(`[${workerId}] 账号 ${active.account} 撞 5h 额度墙 → 休眠至 `
+        + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false })
+        + `，任务转下一个账号（${attempt}/${MAX_ATTEMPTS}）`, 'warn');
+      continue;
+    }
+    if (err.authExpired) {
+      try {
+        await client.reportAccount({
+          agent_id: cfg.agentId, account_id: account.id, ok: false,
+          code: err.upstreamCode || '10001106', message: String(err.message).slice(0, 260),
+        });
+      } catch (e2) { log(`[${workerId}] 失效回报失败：${e2.message}`, 'warn'); }
+      log(`[${workerId}] 账号 ${active.account} cookie 失效 → 转下一个账号（${attempt}/${MAX_ATTEMPTS}）`, 'warn');
+      continue;
+    }
+    // 确定性失败（PARAM / 内容审核）换哪个号都一样，直接终态
+    if (out.error_kind === failure.KIND.PARAM || out.error_kind === failure.KIND.CONTENT_MODERATION) {
+      log(`[${workerId}]   ❌ 确定性失败[${out.error_kind}]，不再换号：${out.error}`, 'error');
+      state.failed += 1;
+      state.lastTask = { taskId: tid, ok: false, detail: out.error.slice(0, 160), kind: out.error_kind, at: Date.now() };
+      await report(tid, out);
+      state.active.delete(tid);
+      state.presence = state.active.size ? 'busy' : 'idle';
+      return;
+    }
+    // 其余（瞬时上游错误/网络抖动）：换下一个账号再试
+    log(`[${workerId}] 账号 ${active.account} 执行失败[${out.error_kind}] → 换号重试：${out.error}`, 'warn');
+  }
+
+  if (!outcome) {
+    outcome = failure.localFailure(failure.KIND.QUOTA,
+      `已尝试 ${tried.length} 个 Genspark 账号均失败（5h 额度墙 / cookie 失效 / 上游错误）`
+      + (lastFailureNote ? `；最后失败：${lastFailureNote}` : '')
+      + ' —— 星点将全额退还');
+  }
+  state.failed += 1;
+  const d = failure.describe(outcome.error_kind);
+  log(`[${workerId}]   ❌ 失败[${d.label}]：${outcome.error}`, 'error');
+  state.lastTask = { taskId: tid, ok: false, detail: outcome.error.slice(0, 160), kind: outcome.error_kind, at: Date.now() };
+  await report(tid, outcome);
+  state.active.delete(tid);
+  state.presence = state.active.size ? 'busy' : 'idle';
 }
 
 /**
@@ -1020,6 +1295,14 @@ async function workerLoop(workerId) {
 async function runTask(task, workerId) {
   const tid = task.task_id;
   const backend = task.backend || cfg.sessionBackend;
+
+  // Genspark 生图走专属派单循环（多账号 failover：额度墙/失效自动换号，
+  // 最多 5 个账号）—— 与通用 runTask 的单次换号语义不同，整体分流。
+  if (backend === 'genspark_image') {
+    await runGensparkTask(task, workerId);
+    return;
+  }
+
   state.claims += 1;
 
   const active = {
