@@ -290,7 +290,8 @@ async function executeTask(task, session, beat, { lease = false, accountId = nul
     return executeAistudio(task, session, beat, { lease, accountId });
   }
 
-  // Genspark 生图（backend=genspark_image，2026-09-28）：纯 HTTP SSE 执行面。
+  // Genspark 生图（backend=genspark_image）：浏览器执行面（Playwright 持久
+  // profile + 页内注入 fetch，过 CF 指纹检测）。
   // 正常派单走 runGensparkTask 的多账号 failover 循环；这里只是兜底分流
   // （比如未来别的调用方直接把任务塞进 executeTask）。
   if (backend === 'genspark_image') {
@@ -767,10 +768,13 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
 // ---------------------------------------------------------------------------
 // Genspark 生图执行（backend=genspark_image，2026-09-28）
 //
-// 执行面 = 纯 HTTP SSE（无浏览器）。凭据 = genspark.ai 登录 cookie；
-// project_id 由执行器凭 cookie 自动创建；出图字节走 mirror 换稳定 URL，
-// 与 aistudio 交付完全同构。额度墙（5h 滚动窗口）抛 QuotaLimitError，
-// 由 runGensparkTask 的多账号 failover 接手。
+// 执行面 = 浏览器（Playwright 持久 profile + 页内注入 fetch 走 ask_proxy
+// SSE，2026-09-28 晚改造）。纯 HTTP 在数据中心 IP 上被 Cloudflare 按
+// TLS/HTTP2 指纹拦截（裁决实验：同机同 IP，curl 403 / Chrome 页内 fetch
+// 200），只有真浏览器指纹能过。凭据 = genspark.ai 登录 cookie（只需
+// session_id）；project_id 由执行器凭 cookie 自动创建；出图字节走 mirror
+// 换稳定 URL，与 aistudio 交付完全同构。额度墙（5h 滚动窗口）抛
+// QuotaLimitError，由 runGensparkTask 的多账号 failover 接手。
 // ---------------------------------------------------------------------------
 async function executeGenspark(task, session, beat, { lease = false, accountId = null } = {}) {
   const prompt = String(task.prompt || '').trim();
@@ -789,6 +793,29 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   // 分辨率档 1K/2K/4K（号池 params.image_resolution；空 = 1K 免费起步档）
   const size = String(task.image_resolution || '1K').trim().toUpperCase();
   const aspect = String(task.aspect_ratio || '1:1').trim();
+
+  // 🔴 全局 tab 排队闸（2026-09-28）：aistudio 与 genspark 共享整机
+  // RH_TAB_LIMIT 个 tab。tab 满不判失败、排队等槽，每 5s beat 续命——
+  // 等槽期间不发心跳就是 900s 被号池回收（初版 5 单全挂的教训）。
+  // 等 20 分钟仍无槽才认失败（出图实测 30~60s/单，20 分钟够消化积压）。
+  const gsTabDeadline = Date.now() + 20 * 60 * 1000;
+  let gsQueuedLogged = false;
+  while (!acct.hasFreeTab()) {
+    if (Date.now() > gsTabDeadline) {
+      return failure.localFailure(failure.KIND.QUOTA,
+        `生图通道繁忙：全局 tab 持续占满（${cfg.tabPool ? `${cfg.tabPool.inUse}/${cfg.tabPool.limit}` : '?'}`
+        + `，已排队 ${Math.round((Date.now() - (gsTabDeadline - 20 * 60 * 1000)) / 1000)}s），请稍后重试`);
+    }
+    if (!gsQueuedLogged) {
+      const pool = cfg.tabPool;
+      log(`  [gs#${accountId}] tab 全忙`
+        + (pool ? `（全局 ${pool.inUse}/${pool.limit}，排队 ${pool.waiting}）` : '')
+        + '，任务排队等待空闲槽位（最长 20 分钟）…');
+      gsQueuedLogged = true;
+    }
+    await beat('AGENT_RUNNING', 5);
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
 
   await beat('AGENT_RUNNING', 5);
   log(`  [gs#${accountId}] 提交：${model} · ${size} · ${aspect}`
@@ -882,8 +909,19 @@ async function runGensparkTask(task, workerId) {
           `等待可用 Genspark 账号超时（15 分钟）—— 账号池全忙/休眠/凭据失效；请检查控制台账号状态`);
         break;
       }
+      // 🔴 号池明确「没有任何账号」时快速失败（否则干等 15 分钟，
+      // 网站侧任务挂着、用户看着永远排队）；等 sleep_until 到点的除外。
+      if (r && !r.ok && r.reason === 'no_account' && r.pool && Number(r.pool.total) === 0) {
+        outcome = failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+          'Genspark 账号池为空（未录入任何 cookie）—— 请在控制台 Genspark 页签添加账号后重试');
+        break;
+      }
       log(`[${workerId}] Genspark 账号全忙或休眠，${cfg.pollSeconds}s 后再试`
         + `（任务 ${tid} 不判失败，已试 ${tried.length} 个）`, 'warn');
+      // 🔴 等待期间必须发心跳：900s 无心跳号池就判「心跳超时」回收任务
+      //（2026-09-28 初版 5 单全挂的根因之一）。
+      // eslint-disable-next-line no-await-in-loop
+      await beat('AGENT_RUNNING', 5);
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, cfg.pollSeconds * 1000));
     }
