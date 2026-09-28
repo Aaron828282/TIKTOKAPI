@@ -88,12 +88,37 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
       if (/login\.live\.com/.test(page.url())) break;
     }
     await page.waitForSelector('div[role="option"]', { timeout: 45000 });
-    // 3) 找最新一封 TikTok 邮件
-    const items = await page.$$eval('div[role="option"]', els => els.map(e => ({
-      label: e.getAttribute('aria-label') || '', text: (e.innerText || '').slice(0, 120),
+    // 3) 找最新一封 TikTok 邮件 —— ⚠️ 新码邮件常有 10~30s 延迟，而收件箱里
+    //    躺着上一轮的旧码邮件。直接抓会拿到过期码（2026-09-28 实测被拒）。
+    //    策略：轮询等「新邮件」（列表相对时间 ≤4 分钟），~90s 后放弃等待、
+    //    退而取最新一封（总预算 180s 内）。
+    const readInbox = () => page.$$eval('div[role="option"]', els => els.map(e => ({
+      label: e.getAttribute('aria-label') || '', text: (e.innerText || '').slice(0, 160),
     })));
-    const hitIdx = items.findIndex(it => /tiktok/i.test(it.label + ' ' + it.text));
-    if (hitIdx < 0) return out({ ok: false, stage: 'no-tiktok-mail', inbox_first3: items.slice(0, 3), _rc: 1 });
+    const ageMinutes = (s) => {
+      const t = s.toLowerCase();
+      if (/just now|\d+\s*second/.test(t)) return 0;
+      const mm = t.match(/(\d+)\s*min/);
+      if (mm) return parseInt(mm[1], 10);
+      return 999; // 钟点时间/Yesterday/日期 = 判不了或旧
+    };
+    let hitIdx = -1, waitedPolls = 0;
+    for (let poll = 0; poll < 9; poll++) {
+      const items = await readInbox();
+      hitIdx = items.findIndex(it => /tiktok/i.test(it.label + ' ' + it.text));
+      if (hitIdx >= 0) {
+        const age = ageMinutes(items[hitIdx].label + ' ' + items[hitIdx].text);
+        if (age <= 4 || poll >= 6) break;   // 够新，或等太久认命用最新的
+      }
+      waitedPolls = poll + 1;
+      await page.waitForTimeout(12000);
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+    }
+    if (hitIdx < 0) {
+      const items = await readInbox().catch(() => []);
+      return out({ ok: false, stage: 'no-tiktok-mail', inbox_first3: items.slice(0, 3), _rc: 1 });
+    }
     await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
     await page.waitForTimeout(3000);
     // 4) 读正文抓 6 位码

@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-TikTok「点选两个相同形状」验证码求解器 —— VPS 部署版。
+TikTok「点选两个相同形状」验证码求解器 —— VPS 部署版 v2（2026-09-28）。
 
-来源：影刀社区方案（Canny 边缘 + 轮廓筛选 + 相似度配对），2026-09-28 经
-真实验证码截图实测改造（本机 F:/api号池/captcha_test/ 实测通过）：
+v1（影刀方案：Canny+轮廓+灰度SSIM）在真实验证码上连错 6 轮，根因：
+  ① 3D 字母带软阴影，Canny 轮廓分裂/粘连；
+  ② 灰度 patch 做 SSIM —— 一对「同形」字母颜色不同（紫S vs 土S），
+     灰度差异反而拉低同形对的分；「同色不同形」（蓝6 vs 蓝e）却因
+     颜色接近拿到虚高分。
 
-  1. 输入 = Playwright 元素截图文件（中文路径安全：np.fromfile + imdecode）；
-  2. 配对 = Hu 矩（log 变换，旋转不变）+ SSIM 混合打分 —— 防止
-     「同色不同形」误配（真实验证码里 U/3/V 三个都是蓝色）；
-  3. 尺寸/阈值动态化；坐标输出**归一化比例** rel_x/rel_y —— 调用方
-     （tiktok_login.js）按元素 boundingBox 映射到任意渲染尺寸。
+v2 改法：
+  ① 物体检测 = HSV 饱和度分割（字母是彩色、背景/阴影是低饱和灰白，
+     天然分离）+ 连通域，不再用 Canny；
+  ② 配对特征 = 二值形状掩码（pad 成方再缩 64×64），Hu 矩（log 变换，
+     旋转不变）+ 掩码 SSIM；再叠加镜像容忍（3D 透视翻面）取 min；
+  ③ 坐标输出相对**整图**的归一化比例（rel_x/rel_y），调用方按元素
+     boundingBox 映射，与截图分辨率/DPR 无关。
 
-依赖刻意只留 opencv-python-headless + numpy（scikit-image 的 SSIM 用
-~20 行高斯窗实现替代，VPS venv 体积从 ~500MB 降到 ~90MB）。
+依赖刻意只留 opencv-python-headless + numpy。
+调试：环境变量 CAP_DEBUG=1 时在 /tmp/capdbg/ 落检测可视化。
 
 用法：python solver.py <图片路径>
 输出：stdout 最后一行 JSON：
@@ -20,18 +25,21 @@ TikTok「点选两个相同形状」验证码求解器 —— VPS 部署版。
    "points": [{"px":..,"py":..,"rel_x":0.44,"rel_y":0.75}, ...]}
 失败：{"ok": false, "reason": "..."}
 """
+import json
+import os
 import sys
 import cv2
 import numpy as np
 
+DEBUG = os.environ.get('CAP_DEBUG') == '1'
+DBG_DIR = '/tmp/capdbg'
+
 
 # ---------------------------------------------------------------- SSIM（手写）
 def _ssim(a, b):
-    """单通道 uint8 → SSIM。高斯窗 11x11 sigma=1.5，与 skimage 默认口径一致。"""
+    """单通道 float → SSIM。高斯窗 11x11 sigma=1.5，与 skimage 默认口径一致。"""
     C1 = (0.01 * 255) ** 2
     C2 = (0.03 * 255) ** 2
-    a = a.astype(np.float64)
-    b = b.astype(np.float64)
     mu_a = cv2.GaussianBlur(a, (11, 11), 1.5)
     mu_b = cv2.GaussianBlur(b, (11, 11), 1.5)
     mu_a2, mu_b2 = mu_a * mu_a, mu_b * mu_b
@@ -68,67 +76,71 @@ def locate_captcha_region(img):
     return best
 
 
-def preprocess(gray):
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    return cv2.Canny(blur, 40, 140)
-
-
 def find_objects(img_bgr, region):
+    """HSV 饱和度分割 + 连通域。返回 (roi, objs)；objs 每项 (x,y,w,h,mask)。"""
     x0, y0, x1, y1 = region
     roi = img_bgr[y0:y1, x0:x1]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    edges = preprocess(gray)
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    objects = []
-    roi_area = max(1, (x1 - x0) * (y1 - y0))
-    for c in cnts:
-        x, y, w, hh = cv2.boundingRect(c)
-        if not (15 < w < 200 and 15 < hh < 200):
-            continue
-        if w * hh < roi_area * 0.0015:
-            continue
-        patch = roi[y:y + hh, x:x + w]
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        mean_s = hsv[:, :, 1].mean()
-        mean_v = hsv[:, :, 2].mean()
-        if mean_v > 222 and mean_s < 22:
-            continue  # 接近纯背景（高亮低饱和）→ 不是物体
-        objects.append((x, y, w, hh))
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    s, v = hsv[:, :, 1].astype(np.int16), hsv[:, :, 2].astype(np.int16)
+    # 字母/形状是彩色（S 高）；背景近白（S 低 V 高）、阴影是灰（S 低 V 中低）
+    mask = ((s > 55) & (v > 60)).astype(np.uint8) * 255
+    # 闭运算把同一字母的笔画连起来；开运算去零星噪点
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
-    # 近邻合并（同一物体被边缘断成两块）
-    merged, used = [], [False] * len(objects)
-    for i in range(len(objects)):
-        if used[i]:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    objs = []
+    roi_area = mask.size
+    for i in range(1, n):
+        x, y, w, hh, area = stats[i]
+        if area < 150 or w < 12 or hh < 12:
             continue
-        rx1, ry1, rw, rh = objects[i]
-        bx1, by1, bx2, by2 = rx1, ry1, rx1 + rw, ry1 + rh
-        for j in range(i + 1, len(objects)):
-            if used[j]:
-                continue
-            ox, oy, ow, oh = objects[j]
-            if (abs((rx1 + rw // 2) - (ox + ow // 2)) < 45
-                    and abs((ry1 + rh // 2) - (oy + oh // 2)) < 45):
-                bx1, by1 = min(bx1, ox), min(by1, oy)
-                bx2, by2 = max(bx2, ox + ow), max(bx2, oy + oh)
-                used[j] = True
-        merged.append((bx1, by1, bx2 - bx1, by2 - by1))
-    return roi, merged
+        if area < roi_area * 0.0012:
+            continue
+        objs.append((int(x), int(y), int(w), int(hh),
+                     (labels == i).astype(np.uint8) * 255))
+    return roi, objs
 
 
-def object_mask(roi, box):
-    x, y, w, hh = box
-    patch = roi[y:y + hh, x:x + w]
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    s, v = hsv[:, :, 1], hsv[:, :, 2]
-    mask = ((v < 218) | (s > 28)).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    return mask
+def square_pad(mask):
+    """掩码 pad 成正方形（保持形状纵横比，不拉伸）。"""
+    h, w = mask.shape[:2]
+    side = max(h, w)
+    out = np.zeros((side, side), dtype=mask.dtype)
+    oy, ox = (side - h) // 2, (side - w) // 2
+    out[oy:oy + h, ox:ox + w] = mask
+    return out
 
 
 def hu_desc(mask):
     m = cv2.moments(mask, binaryImage=True)
     hu = cv2.HuMoments(m).flatten()[:7]
     return np.sign(hu) * (-1e-1 - np.log10(np.abs(hu) + 1e-30))
+
+
+def rotate_mask(m, ang):
+    """掩码绕中心旋转 ang 度（保持尺寸，边界补 0）。"""
+    h, w = m.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), ang, 1.0)
+    return cv2.warpAffine(m, M, (w, h), flags=cv2.INTER_NEAREST)
+
+
+def pair_score(m1_64, m2_64):
+    """旋转+镜像搜索后的最大 IoU —— 直接实现「旋转后同形」的题意。
+
+    Hu 矩对这类带透视的胖 3D 字母分辨力不足（实测紫S配蓝g），
+    IoU 在 64×64 二值掩码上区分度显著更高，且计算量可忽略。
+    """
+    best = 0.0
+    variants = [m2_64, m2_64[:, ::-1]]  # 原始 + 镜像（3D 翻面）
+    for mv in variants:
+        for ang in range(0, 180, 15):
+            r = rotate_mask(mv, ang)
+            inter = float(np.logical_and(m1_64 > 0, r > 0).sum())
+            union = float(np.logical_or(m1_64 > 0, r > 0).sum())
+            if union > 0:
+                best = max(best, inter / union)
+    return best
 
 
 def main():
@@ -138,48 +150,56 @@ def main():
         img = load_image(src)
         if img is None:
             out["reason"] = "图片解码失败"
-            print(out); return
+            print(json.dumps(out, ensure_ascii=False)); return
         H, W = img.shape[:2]
         box = locate_captcha_region(img)
         region = ((box[0], box[1], box[0] + box[2], box[1] + box[3])
                   if box else (0, 0, W, H))
         roi, objs = find_objects(img, region)
+        if DEBUG:
+            os.makedirs(DBG_DIR, exist_ok=True)
+            base = os.path.splitext(os.path.basename(src))[0]
+            vis = roi.copy()
+            for k, (x, y, w, hh, _m) in enumerate(objs):
+                cv2.rectangle(vis, (x, y), (x + w, y + hh), (0, 0, 255), 2)
+                cv2.putText(vis, str(k), (x + 2, y + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            cv2.imwrite(os.path.join(DBG_DIR, base + '.boxes.png'), vis)
         if len(objs) < 2:
             out["reason"] = f"objects<2 ({len(objs)})"
-            print(out); return
+            print(json.dumps(out, ensure_ascii=False)); return
 
+        # 特征：二值形状掩码（pad 方 → 64×64 float），Hu 矩 + SSIM 用同一掩码
         feats = []
-        for b in objs:
-            x, y, w, hh = b
-            patch = roi[y:y + hh, x:x + w]
-            m = cv2.resize(object_mask(roi, b), (64, 64))
-            g = cv2.resize(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY), (64, 64))
-            feats.append((hu_desc(m), g))
+        for (x, y, w, hh, m) in objs:
+            m64 = cv2.resize(square_pad(m), (64, 64),
+                             interpolation=cv2.INTER_AREA).astype(np.float64) / 255.0
+            feats.append((hu_desc(m), m64,
+                          (x + w / 2.0, y + hh / 2.0)))
 
         best_score, best_pair = -1.0, None
         for i in range(len(feats)):
             for j in range(i + 1, len(feats)):
-                d_hu = float(np.linalg.norm(feats[i][0] - feats[j][0]))
-                score = 0.65 * (1.0 / (1.0 + d_hu)) + 0.35 * _ssim(feats[i][1], feats[j][1])
+                score = pair_score(feats[i][1], feats[j][1])
+                if DEBUG:
+                    print(f'# pair {i}-{j}: iou={score:.3f}', file=sys.stderr)
                 if score > best_score:
                     best_score, best_pair = score, (i, j)
 
         i, j = best_pair
         ox, oy = region[0], region[1]
-        rw = max(1, region[2] - ox)
-        rh = max(1, region[3] - oy)
         pts = []
         for k in (i, j):
-            x, y, w, hh = objs[k]
-            cx, cy = x + w // 2, y + hh // 2
-            pts.append({"px": int(cx + ox), "py": int(cy + oy),
-                        "rel_x": round(cx / rw, 4), "rel_y": round(cy / rh, 4)})
+            cx, cy = feats[k][2]
+            px, py = cx + ox, cy + oy
+            pts.append({"px": int(px), "py": int(py),
+                        "rel_x": round(px / W, 4), "rel_y": round(py / H, 4)})
         out = {"ok": True, "pair": [int(i), int(j)],
                "score": round(best_score, 3), "points": pts}
-        print(out)
+        print(json.dumps(out, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
         out = {"ok": False, "reason": f"exception: {e}"}
-        print(out)
+        print(json.dumps(out, ensure_ascii=False))
 
 
 if __name__ == "__main__":
