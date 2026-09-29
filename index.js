@@ -724,17 +724,21 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
           });
         } catch (perr) {
           if (perr.quotaLimited) {
-            // 探针撞墙 = 加号即验失败的最常见真实原因，按额度墙处置：
-            // sleep_until（官方重置点 + 2min）回报，控制台标红 GENSPARK_5H_LIMIT。
-            const until = perr.resetTs
-              ? perr.resetTs + cfg.gensparkSleepBufferSeconds
-              : Math.floor(Date.now() / 1000) + 1800;
+            // 探针撞墙：epoch 已复现 = 真墙（sleep 重置点+2min）；首见/滚动 =
+            // 疑似假墙，只给短冷却，不冤枉账号休眠 1.5h。
+            const suspect = Boolean(perr.quotaSuspect);
+            const until = suspect
+              ? Math.floor(Date.now() / 1000) + cfg.gensparkSoftWallCooldownSeconds
+              : (perr.resetTs
+                  ? perr.resetTs + cfg.gensparkSleepBufferSeconds
+                  : Math.floor(Date.now() / 1000) + 1800);
             await client.reportAccount({
               agent_id: cfg.agentId, account_id: id, ok: false,
-              code: 'GENSPARK_5H_LIMIT', message: String(perr.message).slice(0, 260),
+              code: suspect ? 'GENSPARK_SOFT_WALL' : 'GENSPARK_5H_LIMIT',
+              message: (suspect ? '[疑似假墙·短冷却] ' : '') + String(perr.message).slice(0, 220),
               sleep_until: until,
             }).catch(() => {});
-            log(`[watch] gs#${id} 生图探针撞 5h 额度墙 → 休眠至 `
+            log(`[watch] gs#${id} 生图探针${suspect ? '疑似假墙（短冷却）' : '撞 5h 额度墙'} → 休眠至 `
               + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false }), 'warn');
             return;
           }
@@ -1158,9 +1162,27 @@ async function runGensparkTask(task, workerId) {
     lastFailureNote = `${active.account}: ${String(out.error).slice(0, 160)}`;
 
     if (err.quotaLimited) {
-      // sleep_until = 官方重置点 + 2min（2026-09-29 用户口径：重置点已实测 10 分
-      // 准确，缓冲收紧）。无官方重置点（临限拒绝/-8）时上游没告诉我们几点恢复，
-      // 保留 30min 保守兜底 —— 到点重试，仍无额度会再次休眠。
+      if (err.quotaSuspect) {
+        // 疑似假墙（重置点 epoch 未复现/滚动）：真伪还没定，绝不能按真墙休眠
+        // 1.5h+ —— 只给短冷却，到点重试。若上游再发同一 epoch，下次就升真墙。
+        const until = Math.floor(Date.now() / 1000) + cfg.gensparkSoftWallCooldownSeconds;
+        try {
+          await client.reportAccount({
+            agent_id: cfg.agentId, account_id: account.id, ok: false,
+            code: 'GENSPARK_SOFT_WALL',
+            message: `[疑似假墙·短冷却] ${String(err.message).slice(0, 220)}`,
+            sleep_until: until,
+          });
+        } catch (e2) { log(`[${workerId}] 休眠回报失败：${e2.message}`, 'warn'); }
+        log(`[${workerId}] 账号 ${active.account} 疑似假墙（重置点未复现）→ 短冷却至 `
+          + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false })
+          + `，任务转下一个账号（${attempt}/${MAX_ATTEMPTS}）`, 'warn');
+        continue;
+      }
+      // 真墙（官方重置点已复现）→ sleep_until = 重置点 + 2min（2026-09-29 用户
+      // 口径：重置点已实测 10 分准确，缓冲收紧）。无官方重置点（临限拒绝/-8）
+      // 时上游没告诉我们几点恢复，保留 30min 保守兜底 —— 到点重试，仍无额度
+      // 会再次休眠。
       const until = err.resetTs
         ? err.resetTs + cfg.gensparkSleepBufferSeconds
         : Math.floor(Date.now() / 1000) + 1800;
