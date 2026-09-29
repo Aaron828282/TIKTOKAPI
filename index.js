@@ -724,21 +724,17 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
           });
         } catch (perr) {
           if (perr.quotaLimited) {
-            // 探针撞墙：epoch 已复现 = 真墙（sleep 重置点+2min）；首见/滚动 =
-            // 疑似假墙，只给短冷却，不冤枉账号休眠 1.5h。
-            const suspect = Boolean(perr.quotaSuspect);
-            const until = suspect
-              ? Math.floor(Date.now() / 1000) + cfg.gensparkSoftWallCooldownSeconds
-              : (perr.resetTs
-                  ? perr.resetTs + cfg.gensparkSleepBufferSeconds
-                  : Math.floor(Date.now() / 1000) + 1800);
+            // 探针撞真额度墙（带 task_id 的响应已在 generate() 内轮询消化，
+            // 落到这里的是纯额度文案）→ sleep_until = 重置点+2min / 30min 兜底。
+            const until = perr.resetTs
+              ? perr.resetTs + cfg.gensparkSleepBufferSeconds
+              : Math.floor(Date.now() / 1000) + 1800;
             await client.reportAccount({
               agent_id: cfg.agentId, account_id: id, ok: false,
-              code: suspect ? 'GENSPARK_SOFT_WALL' : 'GENSPARK_5H_LIMIT',
-              message: (suspect ? '[疑似假墙·短冷却] ' : '') + String(perr.message).slice(0, 220),
+              code: 'GENSPARK_5H_LIMIT', message: String(perr.message).slice(0, 260),
               sleep_until: until,
             }).catch(() => {});
-            log(`[watch] gs#${id} 生图探针${suspect ? '疑似假墙（短冷却）' : '撞 5h 额度墙'} → 休眠至 `
+            log(`[watch] gs#${id} 生图探针撞 5h 额度墙 → 休眠至 `
               + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false }), 'warn');
             return;
           }
@@ -1162,27 +1158,10 @@ async function runGensparkTask(task, workerId) {
     lastFailureNote = `${active.account}: ${String(out.error).slice(0, 160)}`;
 
     if (err.quotaLimited) {
-      if (err.quotaSuspect) {
-        // 疑似假墙（重置点 epoch 未复现/滚动）：真伪还没定，绝不能按真墙休眠
-        // 1.5h+ —— 只给短冷却，到点重试。若上游再发同一 epoch，下次就升真墙。
-        const until = Math.floor(Date.now() / 1000) + cfg.gensparkSoftWallCooldownSeconds;
-        try {
-          await client.reportAccount({
-            agent_id: cfg.agentId, account_id: account.id, ok: false,
-            code: 'GENSPARK_SOFT_WALL',
-            message: `[疑似假墙·短冷却] ${String(err.message).slice(0, 220)}`,
-            sleep_until: until,
-          });
-        } catch (e2) { log(`[${workerId}] 休眠回报失败：${e2.message}`, 'warn'); }
-        log(`[${workerId}] 账号 ${active.account} 疑似假墙（重置点未复现）→ 短冷却至 `
-          + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false })
-          + `，任务转下一个账号（${attempt}/${MAX_ATTEMPTS}）`, 'warn');
-        continue;
-      }
-      // 真墙（官方重置点已复现）→ sleep_until = 重置点 + 2min（2026-09-29 用户
-      // 口径：重置点已实测 10 分准确，缓冲收紧）。无官方重置点（临限拒绝/-8）
-      // 时上游没告诉我们几点恢复，保留 30min 保守兜底 —— 到点重试，仍无额度
-      // 会再次休眠。
+      // 🔴 2026-09-29 用户口径终版：带 task_id 的响应在执行器内已按任务受理
+      // 轮询处理（genspark.js _pollTaskStatus），落到这里的 QuotaLimitError
+      // 只有真额度墙（无 task_id 的纯额度文案）——休眠 重置点+2min；
+      // 无重置点（临限 Approaching）30min 兜底。到点租约自动放行。
       const until = err.resetTs
         ? err.resetTs + cfg.gensparkSleepBufferSeconds
         : Math.floor(Date.now() / 1000) + 1800;
