@@ -735,7 +735,7 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
               sleep_until: until,
             }).catch(() => {});
             log(`[watch] gs#${id} 生图探针撞 5h 额度墙 → 休眠至 `
-              + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false }), 'warn');
+              + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' }), 'warn');
             return;
           }
           // 非额度类探针失败（上游抖动等）：登录态本身是好的，标红但不停用，
@@ -1173,7 +1173,7 @@ async function runGensparkTask(task, workerId) {
         });
       } catch (e2) { log(`[${workerId}] 休眠回报失败：${e2.message}`, 'warn'); }
       log(`[${workerId}] 账号 ${active.account} 撞 5h 额度墙 → 休眠至 `
-        + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false })
+        + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })
         + `，任务转下一个账号（${attempt}/${MAX_ATTEMPTS}）`, 'warn');
       continue;
     }
