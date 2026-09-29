@@ -251,10 +251,12 @@ const server = http.createServer((req, res) => {
 // 状态变化同步写进 state.active 里那条的 phase/progress。
 // ---------------------------------------------------------------------------
 function makeBeater(taskId, active) {
-  const hb = { last: 0, fails: 0, status: '' };
-  return async function beat(status = null, progress = null) {
+  const hb = { last: 0, fails: 0, status: '', channel: '' };
+  return async function beat(status = null, progress = null, channel = null) {
     const now = Date.now();
-    const forced = Boolean(status) && status !== hb.status;
+    const forced = (Boolean(status) && status !== hb.status)
+      // 通道切换也是强有心跳：B 回落 A 的瞬间要让号池立刻知道（2026-09-30）
+      || (Boolean(channel) && channel !== hb.channel);
     if (!forced && now - hb.last < cfg.heartbeatSeconds * 1000) return;
     hb.last = now;
 
@@ -263,9 +265,10 @@ function makeBeater(taskId, active) {
       active.phase = status;
     }
     if (progress !== null && progress !== undefined) active.progress = progress;
+    if (channel) hb.channel = channel;
 
     try {
-      await client.heartbeat(taskId, { status, progress, agentId: cfg.agentId });
+      await client.heartbeat(taskId, { status, progress, agentId: cfg.agentId, channel: channel || hb.channel || null });
       hb.fails = 0;
     } catch (err) {
       hb.fails += 1;
@@ -622,8 +625,19 @@ if (cfg.gensparkEnabled) {
             code: 'GENSPARK_HEALTH',
             message: `${info.email || '?'} · plan=${info.plan || '未知'}`,
             plan: info.plan || '',
+            // 通道B 免费池余量快照（2026-09-30）：控制台「通道B」列的数据源。
+            // 没采到就不带（号池按字段合并，旧快照保留）。
+            ...(info.freePool ? {
+              info: { ws: {
+                remaining: info.freePool.remaining, limit: info.freePool.limit,
+                spent: info.freePool.spent, reset_at: info.freePool.resetAt,
+                ts: Math.floor(Date.now() / 1000),
+              } },
+            } : {}),
           });
-          log(`  [gs#${acc.id}] 巡检通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
+          log(`  [gs#${acc.id}] 巡检通过（${info.email || '?'} · plan=${info.plan || '未知'}`
+            + (info.freePool ? ` · B池余 $${info.freePool.remaining}/$${info.freePool.limit}` : '')
+            + '）');
         // 登录型：仅当本次 health() 真正执行了填表重登才回传 cookie。
         // 🔴 健康路径回传 = version+1 → 看门狗对账发现变化 → 再 verifyNow →
         // 死循环（2026-09-29 实锤：30s 一轮 × N 号空烧浏览器）。
@@ -1032,9 +1046,23 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   if (wsEligible) {
     try {
       log(`  [gs#${accountId}] 1K 任务：先试 WS 免费池通道（B）…`);
+      await beat('AGENT_RUNNING', 5, 'ws');   // 选路即上报：控制台执行中就能看到通道
       out = await acct.generateWs({ prompt, model, size, aspect });
       log(`  [gs#${accountId}] ✅ B 通道成功：model=${out.model} files=${out.filesWs}`
         + (out.freePool ? ` · 池余 $${out.freePool.remaining}/$${out.freePool.limit} · 重置 ${out.freePool.resetAt}` : ''));
+      // B 通道余量快照顺手回报（fire-and-forget）：控制台账号行「通道B 免费池」
+      // 的数据源之一（巡检 6 小时一轮太稀，跑单后的快照更鲜）。
+      // ⚠️ 只带 info 不带 ok/code —— 账号回报端点见到 ok/code 会重写验活结论。
+      if (out.freePool && out.freePool.ok) {
+        client.reportAccount({
+          agent_id: cfg.agentId, account_id: accountId,
+          info: { ws: {
+            remaining: out.freePool.remaining, limit: out.freePool.limit,
+            spent: out.freePool.spent, reset_at: out.freePool.resetAt,
+            ts: Math.floor(Date.now() / 1000),
+          } },
+        }).catch(() => {});
+      }
     } catch (err) {
       if (err && err.errorKind === 'PARAM') throw err;   // 路由约束违规是节点 bug，直接暴露
       log(`  [gs#${accountId}] B 通道不可用（${String(err.message).slice(0, 140)}）→ 回落通道A`, 'warn');
@@ -1042,6 +1070,7 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     }
   }
   if (!out) {
+    await beat('AGENT_RUNNING', 5, 'browser');   // 通道A（或 B 回落后的实际通道）
     try {
       out = await acct.generate({ prompt, model, size, aspect });
     } catch (err) {
@@ -1064,9 +1093,19 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     return failure.localFailure(failure.KIND.UPSTREAM_ERROR,
       '图已生成但 RH_MIRROR_URL 未配置，成品无处转存 —— 请在节点环境补齐交付端点');
   }
-  const outputUrl = await mirror(out.bytes, `${task.task_id}.${ext}`, task.task_id, {
-    contentType: out.contentType,
-  });
+  let outputUrl;
+  try {
+    outputUrl = await mirror(out.bytes, `${task.task_id}.${ext}`, task.task_id, {
+      contentType: out.contentType,
+    });
+  } catch (err) {
+    // 🔴 2026-09-30 事故：图已生成（额度已花），转存失败却按普通失败换号重试
+    // —— 3 个号各重新生图一遍，白烧额度，最后在租号循环里空转 15 分钟刷
+    // 「租不到账号」。转存失败换号毫无意义（图都成了，别的号重画是纯浪费），
+    // 打上 mirrorFailed 标记让 runGensparkTask 直接终态。
+    err.mirrorFailed = true;
+    throw err;
+  }
   log(`  [gs#${accountId}] 已转存 → ${outputUrl.slice(0, 100)}`);
 
   return {
@@ -1140,6 +1179,17 @@ async function runGensparkTask(task, workerId) {
           'Genspark 账号池为空（未录入任何账号）—— 请在控制台 Genspark 页签添加账号后重试');
         break;
       }
+      // 🔴 号池明确「可用账号全被排除」（2026-09-30）：换号重试已把池子里每个
+      // 可用号都试失败过，继续等也租不到 —— 空转 15 分钟只会让控制台刷屏
+      // 「租不到账号」。立即终态，等 sleep_until 复活的号不在本条覆盖内
+      //（休眠号不满足「当前可租」，等它复活是另一条合法路径）。
+      if (r && !r.ok && r.reason === 'exhausted') {
+        outcome = failure.localFailure(failure.KIND.QUOTA,
+          `已试过 ${tried.length} 个 Genspark 账号全部失败，池中再无未试过的可用账号`
+          + (lastFailureNote ? `；最后失败：${lastFailureNote}` : '')
+          + ' —— 星点将全额退还');
+        break;
+      }
       log(`[${workerId}] Genspark 账号全忙或休眠，${cfg.pollSeconds}s 后再试`
         + `（任务 ${tid} 不判失败，已试 ${tried.length} 个）`, 'warn');
       // 🔴 等待期间必须发心跳：900s 无心跳号池就判「心跳超时」回收任务
@@ -1195,6 +1245,24 @@ async function runGensparkTask(task, workerId) {
     await client.releaseSession({ taskId: tid, accountId: account.id }).catch(() => {});
     lastFailureNote = `${active.account}: ${String(out.error).slice(0, 160)}`;
 
+    // 🔴 转存失败 → 立即终态（2026-09-30）：图已生成、额度已花，换号重画是
+    // 纯浪费（还会把所有号拖进 exclude 触发「租不到账号」空转）。
+    if (err.mirrorFailed) {
+      // 409 = 网站按任务号找不到工单 —— 控制台/直发的测试单必然如此（只有
+      // 网站发起的任务才有 generation_job 可落库）；给运营一句能看懂的结论。
+      if (/409|No generation job/i.test(out.error)) {
+        out.error = `${out.error} —— 图已成功生成（额度已消耗），但该任务不是从网站发起、`
+          + '网站侧没有对应工单可落库（控制台直发测试单的预期现象）；'
+          + '从网站发起的生图任务不受此限制';
+      }
+      log(`  ❌ 图已生成但转存失败，不再换号重画：${out.error}`, 'error');
+      state.failed += 1;
+      state.lastTask = { taskId: tid, ok: false, detail: out.error.slice(0, 160), kind: out.error_kind, at: Date.now() };
+      await report(tid, out);
+      state.active.delete(tid);
+      state.presence = state.active.size ? 'busy' : 'idle';
+      return;
+    }
     if (err.quotaLimited) {
       // 🔴 2026-09-29 用户口径终版：带 task_id 的响应在执行器内已按任务受理
       // 轮询处理（genspark.js _pollTaskStatus），落到这里的 QuotaLimitError
