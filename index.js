@@ -658,11 +658,13 @@ if (cfg.gensparkEnabled) {
 //
 // 做法：每 30s 拉一次两个生图后端的账号清单（打的是自家号池，几十 KB），
 // 与上次见过的 id→version 对照，新出现/版本变化的账号进入**串行**验证链：
-//   · genspark：health()（登录型会借机自动登录）→ reportAccount 回报结论；
+//   · genspark：health()（登录型会借机自动登录）→ **真实生图探针**（1K 最小
+//     图；2026-09-29 用户要求：登录成功≠能生图，#18 添加前窗口已被烧完）
+//     → reportAccount 回报结论；探针撞墙按额度墙处置（sleep_until=重置+2min）。
 //     登录型成功后**收割 profile cookie 回传号池**（login-refresh 回填，
 //     version+1，控制台从「等待自动登录」变成真实 cookie + 到期时间）。
 //     回填后 session 变 cookie 型 → 下一轮触发只 reportAccount、不再回传
-//     —— 天然终止，不会形成回传循环。
+//     —— 天然终止，不会形成回传循环。探针 4h 内同号不重探（防烧额度）。
 //   · aistudio：ensure()（登录型自动登录，profile 自持则秒过）→ 只回报
 //     验证结论，**不回传 cookie** —— Google 会话是环境绑定的（2026-09-27
 //     实锤：导出离开原浏览器几分钟即被 1PSIDTS 轮换作废），回传一份秒死
@@ -672,6 +674,7 @@ if (cfg.gensparkEnabled) {
 // ---------------------------------------------------------------------------
 if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
   const verifySeen = new Map();          // backend -> Map(id -> version)
+  const gsProbeAt = new Map();           // genspark id -> 上次生图探针时间（4h 内不重探）
   let verifyChain = Promise.resolve();   // 串行：多个新账号不并发挤爆浏览器
   const verifyNow = async (backend, acc) => {
     const id = Number(acc.id);
@@ -680,13 +683,54 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
       try {
         const acct = gensparkPool.get(id, normalizeGsSession(acc.session || {}));
         const info = await acct.health();
+        // 🔴 生图探针（2026-09-29 用户要求）：登录成功≠能生图 —— #18 实锤：
+        // 账号在添加之前 5h 窗口就被人烧完，登录/巡检全绿，一发真实生图单
+        // 才撞墙。加号即验必须包含一次真实生图（1K 最小图，消耗窗口内 1 张
+        // 额度，用户已接受）。同号 4h 内只探一次：cookie 回传会让 version+1
+        // 再触发看门狗，不设防会把额度烧在探针上。
+        const lastProbe = gsProbeAt.get(id) || 0;
+        if (Date.now() - lastProbe < 4 * 3600_000) {
+          log(`[watch] gs#${id} 生图探针 4h 内已验证过，跳过（登录态健康）`);
+          return;
+        }
+        gsProbeAt.set(id, Date.now());
+        try {
+          await acct.generate({
+            prompt: 'a small matte blue circle centered on a plain white background',
+            model: 'gpt-image-2', size: '1K', aspect: '1:1',
+          });
+        } catch (perr) {
+          if (perr.quotaLimited) {
+            // 探针撞墙 = 加号即验失败的最常见真实原因，按额度墙处置：
+            // sleep_until（官方重置点 + 2min）回报，控制台标红 GENSPARK_5H_LIMIT。
+            const until = perr.resetTs
+              ? perr.resetTs + cfg.gensparkSleepBufferSeconds
+              : Math.floor(Date.now() / 1000) + 1800;
+            await client.reportAccount({
+              agent_id: cfg.agentId, account_id: id, ok: false,
+              code: 'GENSPARK_5H_LIMIT', message: String(perr.message).slice(0, 260),
+              sleep_until: until,
+            }).catch(() => {});
+            log(`[watch] gs#${id} 生图探针撞 5h 额度墙 → 休眠至 `
+              + new Date(until * 1000).toLocaleString('zh-CN', { hour12: false }), 'warn');
+            return;
+          }
+          // 非额度类探针失败（上游抖动等）：登录态本身是好的，标红但不停用，
+          // 后续任务成功或 6h 巡检会覆盖这个结论。
+          await client.reportAccount({
+            agent_id: cfg.agentId, account_id: id, ok: false,
+            code: 'GENSPARK_PROBE_FAIL', message: String(perr.message).slice(0, 260),
+          }).catch(() => {});
+          log(`[watch] gs#${id} 生图探针失败（登录态正常）：${perr.message}`, 'warn');
+          return;
+        }
         await client.reportAccount({
           agent_id: cfg.agentId, account_id: id, ok: true,
           code: 'GENSPARK_HEALTH',
-          message: `加号即验通过（${info.email || '?'} · plan=${info.plan || '未知'}）`,
+          message: `加号即验通过（含真实生图探针 · ${info.email || '?'} · plan=${info.plan || '未知'}）`,
           plan: info.plan || '',
         });
-        log(`[watch] gs#${id} 立即验证通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
+        log(`[watch] gs#${id} 立即验证通过（含生图探针 · ${info.email || '?'} · plan=${info.plan || '未知'}）`);
         // 登录型：收割 cookie 回传号池（cookie 型已有凭据，无需回传）。
         if (kind === 'genspark_login') {
           const cookie = await acct.getCookieHeader();
@@ -1004,7 +1048,7 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
  * Genspark 任务的派单与多账号 failover（用户口径 2026-09-28）：
  *
  *   · 每账号 5 槽位（号池 max_slots 记账）；
- *   · 撞 5h 额度墙 → 账号回报 sleep_until（官方重置点 + 30min），任务**立即**
+ *   · 撞 5h 额度墙 → 账号回报 sleep_until（官方重置点 + 2min），任务**立即**
  *     转下一个账号的空槽，用户无感；
  *   · cookie 失效 → 账号标记失效，同样转下一个；
  *   · 确定性失败（PARAM / 内容审核）直接终态，不烧后续账号；
@@ -1110,8 +1154,12 @@ async function runGensparkTask(task, workerId) {
     lastFailureNote = `${active.account}: ${String(out.error).slice(0, 160)}`;
 
     if (err.quotaLimited) {
-      // 官方重置点 + 30min 缓冲 → 账号 sleep_until（status 不动，租约 SQL 到点自动放行）
-      const until = (err.resetTs || Math.floor(Date.now() / 1000)) + cfg.gensparkSleepBufferSeconds;
+      // sleep_until = 官方重置点 + 2min（2026-09-29 用户口径：重置点已实测 10 分
+      // 准确，缓冲收紧）。无官方重置点（临限拒绝/-8）时上游没告诉我们几点恢复，
+      // 保留 30min 保守兜底 —— 到点重试，仍无额度会再次休眠。
+      const until = err.resetTs
+        ? err.resetTs + cfg.gensparkSleepBufferSeconds
+        : Math.floor(Date.now() / 1000) + 1800;
       try {
         await client.reportAccount({
           agent_id: cfg.agentId, account_id: account.id, ok: false,
