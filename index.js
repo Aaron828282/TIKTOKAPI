@@ -624,9 +624,10 @@ if (cfg.gensparkEnabled) {
             plan: info.plan || '',
           });
           log(`  [gs#${acc.id}] 巡检通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
-          // 登录型：巡检触发的自动登录成功后同样回传 cookie（与看门狗同口径；
-          // 回填后 session 变 cookie 型，下轮巡检不再回传 —— 天然终止）。
-          if ((acc.session || {}).kind === 'genspark_login') {
+        // 登录型：仅当本次 health() 真正执行了填表重登才回传 cookie。
+        // 🔴 健康路径回传 = version+1 → 看门狗对账发现变化 → 再 verifyNow →
+        // 死循环（2026-09-29 实锤：30s 一轮 × N 号空烧浏览器）。
+        if ((acc.session || {}).kind === 'genspark_login' && info.relogin) {
             const cookie = await acct.getCookieHeader();
             if (cookie.includes('session_id=')) {
               await client.loginReport({
@@ -686,9 +687,9 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
       try {
         const acct = gensparkPool.get(id, normalizeGsSession(acc.session || {}));
         const info = await acct.health();
-        // 登录型：先收割 cookie 回传号池（探针撞墙也不影响回传 —— cookie 是
-        // 登录态的成果，跟额度是两回事）。
-        if (kind === 'genspark_login') {
+        // 登录型：仅当本次 health() 真正执行了填表重登才收割回传（探针撞墙
+        // 也不影响 —— 但健康路径绝不回传，否则 version+1 自激循环）。
+        if (kind === 'genspark_login' && info.relogin) {
           const cookie = await acct.getCookieHeader();
           if (cookie.includes('session_id=')) {
             try {
