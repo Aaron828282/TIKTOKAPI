@@ -2,3 +2,8 @@ node_modules/
 logs/
 *.log
 certs/
+
+# 本地调试产物不入库（2026-09-29）
+selftest/
+__pycache__/
+*.pyc
