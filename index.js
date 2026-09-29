@@ -1156,13 +1156,25 @@ async function runGensparkTask(task, workerId) {
   let outcome = null;
   let lastFailureNote = '';
 
+  // 🔴 B 通道优先租号（2026-09-30 用户口径）：这单够 B 通道准入（WS 开启 +
+  // 1K + gpt-image 系模型）时，租号就带 prefer_ws —— 号池把「B 余额有剩」
+  // 的号排队首，且**余额重置越近越优先**（先烧快过期的免费池，避免重置
+  // 清零浪费）。选路兜底仍在 executeGenspark：租到的号 B 实际没额度就回落 A。
+  const gsModel = String((task.agent || {}).model_id || 'gpt-image-2');
+  const gsSize = String(task.image_resolution || '1K').trim().toUpperCase();
+  const preferWs = Boolean(cfg.gensparkWsEnabled) && gsSize === '1K'
+    && genspark.MODELS.has(gsModel);
+  if (preferWs) {
+    log(`[${workerId}] 任务 ${tid} 走 B 通道优先租号（号池按 B 余额重置时间升序挑号，先烧快过期的免费池）`);
+  }
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS && !stopping; attempt += 1) {
     // ---- 租一个没试过的账号（exclude 已试清单；全忙/休眠时轮询等待） ----
     let r = null;
     const leaseDeadline = Date.now() + LEASE_WAIT_MS;
     for (;;) {
       try {
-        r = await client.leaseSession({ backend, taskId: tid, exclude: tried });
+        r = await client.leaseSession({ backend, taskId: tid, exclude: tried, preferWs });
       } catch (err) {
         log(`[${workerId}] 租号请求失败：${err.message}`, 'warn');
       }
