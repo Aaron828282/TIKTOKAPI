@@ -617,7 +617,10 @@ if (cfg.gensparkEnabled) {
           const info = await acct.health();
           await client.reportAccount({
             agent_id: cfg.agentId, account_id: acc.id, ok: true,
-            code: 'GENSPARK_HEALTH', message: `plan=${info.plan || '未知'}`,
+            // 2026-09-29 用户口径：控制台账号行显示邮箱 —— cookie 型账号的邮箱
+            // 只能靠这条回报文案（号池从 verify_note 正则解析），必须带上。
+            code: 'GENSPARK_HEALTH',
+            message: `${info.email || '?'} · plan=${info.plan || '未知'}`,
             plan: info.plan || '',
           });
           log(`  [gs#${acc.id}] 巡检通过（${info.email || '?'} · plan=${info.plan || '未知'}）`);
@@ -683,6 +686,26 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
       try {
         const acct = gensparkPool.get(id, normalizeGsSession(acc.session || {}));
         const info = await acct.health();
+        // 登录型：先收割 cookie 回传号池（探针撞墙也不影响回传 —— cookie 是
+        // 登录态的成果，跟额度是两回事）。
+        if (kind === 'genspark_login') {
+          const cookie = await acct.getCookieHeader();
+          if (cookie.includes('session_id=')) {
+            try {
+              const r = await client.loginReport({
+                account_id: id, ok: true, cookie,
+                note: '加号即验：节点自动登录成功，cookie 已回传',
+              });
+              log(`[watch] gs#${id} 登录 cookie 已回传号池`
+                + (r && r.version ? `（v${r.version}）` : ''));
+            } catch (err) {
+              log(`[watch] gs#${id} cookie 回传失败（不影响执行，下轮巡检可再触发）：`
+                + err.message, 'warn');
+            }
+          } else {
+            log(`[watch] gs#${id} 登录成功但 profile 里没收到 session_id —— 跳过回传`, 'warn');
+          }
+        }
         // 🔴 生图探针（2026-09-29 用户要求）：登录成功≠能生图 —— #18 实锤：
         // 账号在添加之前 5h 窗口就被人烧完，登录/巡检全绿，一发真实生图单
         // 才撞墙。加号即验必须包含一次真实生图（1K 最小图，消耗窗口内 1 张
@@ -731,25 +754,6 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
           plan: info.plan || '',
         });
         log(`[watch] gs#${id} 立即验证通过（含生图探针 · ${info.email || '?'} · plan=${info.plan || '未知'}）`);
-        // 登录型：收割 cookie 回传号池（cookie 型已有凭据，无需回传）。
-        if (kind === 'genspark_login') {
-          const cookie = await acct.getCookieHeader();
-          if (cookie.includes('session_id=')) {
-            try {
-              const r = await client.loginReport({
-                account_id: id, ok: true, cookie,
-                note: '加号即验：节点自动登录成功，cookie 已回传',
-              });
-              log(`[watch] gs#${id} 登录 cookie 已回传号池`
-                + (r && r.version ? `（v${r.version}）` : ''));
-            } catch (err) {
-              log(`[watch] gs#${id} cookie 回传失败（不影响执行，下轮巡检可再触发）：`
-                + err.message, 'warn');
-            }
-          } else {
-            log(`[watch] gs#${id} 登录成功但 profile 里没收到 session_id —— 跳过回传`, 'warn');
-          }
-        }
       } catch (err) {
         const msg = String(err.message).slice(0, 260);
         // 登录型失败走 login-refresh 的 ok=false 通道（号池记 login_note，
