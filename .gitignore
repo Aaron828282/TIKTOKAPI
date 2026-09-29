@@ -7,3 +7,12 @@ certs/
 selftest/
 __pycache__/
 *.pyc
+
+# 服务器敏感运行数据绝不入库（autopush 0929）
+.env
+.env.*
+!.env.example
+.vncpass
+data/
+*.bak*
+venv/
