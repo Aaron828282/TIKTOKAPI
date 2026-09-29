@@ -706,6 +706,18 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
             log(`[watch] gs#${id} 登录成功但 profile 里没收到 session_id —— 跳过回传`, 'warn');
           }
         }
+        // 🔴 验活/会员档即时落库（2026-09-29）：loginReport 回填会 version+1
+        // 并把 verify_* 归零（「写凭据归零」语义），而此前只在**探针也成功**后
+        // 才回报 health —— 探针撞墙/4h 跳过的路径永远停在「待验 + 会员档未知」。
+        // health() 一通过就先回报结论（verify=ok + plan），探针只决定
+        // sleep_until，不再影响这两列。这也正好满足「每次自动重登后都复测
+        // 会员档」——重登就发生在 health() 里，info 是重登后的新鲜值。
+        await client.reportAccount({
+          agent_id: cfg.agentId, account_id: id, ok: true,
+          code: 'GENSPARK_HEALTH',
+          message: `加号即验：登录态健康（${info.email || '?'} · plan=${info.plan || '未知'}）`,
+          plan: info.plan || '',
+        }).catch(() => {});
         // 🔴 生图探针（2026-09-29 用户要求）：登录成功≠能生图 —— #18 实锤：
         // 账号在添加之前 5h 窗口就被人烧完，登录/巡检全绿，一发真实生图单
         // 才撞墙。加号即验必须包含一次真实生图（1K 最小图，消耗窗口内 1 张
