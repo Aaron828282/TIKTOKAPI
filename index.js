@@ -607,15 +607,50 @@ if (cfg.gensparkEnabled) {
   //   · plan != plus → 号池自动停用（agent_gateway 按 plan 判定）
   //   · 401/403     → 账号验活失败（控制台标红；登录型会先自动重登一次再探）
   //   · 正常        → 刷新 plan + 验活通过；cookie 20 天滑动续期顺手完成
+  //   · 🔴 已停用号（2026-09-30 用户口径）→ 不走 6h 巡检，会员档**每天只探
+  //     一次**；某天探到恢复 Plus → 回报号池自动翻回 active 正常运营。
+  const gsPausedPlanProbeAt = new Map();   // 停用号 id → 上次日探时刻
   const gsHealthRound = async () => {
     try {
-      const r = await client.listAccounts('genspark_image');
+      // include_paused=true：把 auto_paused=1 的系统停用号也拉下来（人工停的
+      // 号号池不下发 —— 机器无权复活人停的号）。
+      const r = await client.listAccounts('genspark_image', true);
       for (const acc of (r.accounts || [])) {
         // 🔴 2026-09-29 修复：这里原来有 `acc.status !== 'active' 就跳过` ——
         // 但 /agent/accounts 端点根本不下发 status 字段（服务端已只挑 active），
         // 恒 undefined ≠ 'active' ⟹ 巡检对每个账号都静默跳过，上线以来一直空转。
         // 整包 session 传入（登录型 creds 没有 cookie，只传 cookie 会误判失效）
         const acct = gensparkPool.get(acc.id, normalizeGsSession(acc.session || {}));
+        // 节点重启后从号池快照还原通道B 停用态（省得每个 1K 任务先烧一次预检）
+        acct.restoreWsState((acc.info || {}).ws);
+        // ---- 停用账号会员档日探（每天仅一次）----
+        if (acc.status === 'paused') {
+          const last = gsPausedPlanProbeAt.get(acc.id) || 0;
+          if (Date.now() - last < cfg.gensparkPausedPlanProbeSeconds * 1000) continue;
+          gsPausedPlanProbeAt.set(acc.id, Date.now());
+          try {
+            const info = await acct.health();
+            // 只带 plan 不带 ok/code：不动验活结论；号池见到 plan 恢复 Plus
+            // 且 auto_paused=1 会自动翻回 active。
+            await client.reportAccount({
+              agent_id: cfg.agentId, account_id: acc.id,
+              plan: info.plan || '',
+              message: `停用账号会员档日探：${info.email || '?'} · plan=${info.plan || '未知'}`,
+              ...(info.freePool ? {
+                info: { ws: {
+                  remaining: info.freePool.remaining, limit: info.freePool.limit,
+                  spent: info.freePool.spent, reset_at: info.freePool.resetAt,
+                  ts: Math.floor(Date.now() / 1000),
+                } },
+              } : {}),
+            }).catch(() => {});
+            log(`  [gs#${acc.id}] 停用账号日探：plan=${info.plan || '未知'}`
+              + (info.plan === 'plus' ? '（已回报号池，自动启用）' : '（仍非 Plus，明天再探）'));
+          } catch (err) {
+            log(`  [gs#${acc.id}] 停用账号日探失败：${err.message}`, 'warn');
+          }
+          continue;
+        }
         try {
           const info = await acct.health();
           await client.reportAccount({
@@ -666,6 +701,46 @@ if (cfg.gensparkEnabled) {
   setInterval(gsHealthRound, cfg.gensparkHealthSeconds * 1000).unref();
   // 启动 90s 后先跑一轮（等首次 listAccounts 可用）
   setTimeout(gsHealthRound, 90_000).unref();
+
+  // 🔴 通道B 停用恢复探测定时器（2026-09-30 用户口径，每 5 分钟扫一轮）：
+  // 停用（余额 <$0.10）且已到恢复探测点（官方重置 + 15min）的号，主动拉一次
+  // 页面余额「激活并探测」：
+  //   · 恢复 ≥ 阈值 → 清停用 + 回报号池（租约排序重新把它排进 B 优先组）；
+  //   · 仍不足     → _applyWsSnapshot 按新重置点续期停用并回报，继续跟踪。
+  // 探测要拉浏览器页（~十几秒），到点的号通常 0~1 个，别担心空烧。
+  const gsWsResumeProbe = async () => {
+    if (!cfg.gensparkWsEnabled) return;
+    try {
+      const r = await client.listAccounts('genspark_image', true);
+      const now = Math.floor(Date.now() / 1000);
+      for (const acc of (r.accounts || [])) {
+        if (acc.status === 'paused') continue;   // 整账号停用：B 随账号一起停
+        const acct = gensparkPool.get(acc.id, normalizeGsSession(acc.session || {}));
+        acct.restoreWsState((acc.info || {}).ws);
+        if (!acct.wsDisabled || !acct.wsResumeAt || now < acct.wsResumeAt) continue;
+        log(`  [gs#${acc.id}] 通道B 已到恢复探测点，激活并探测余额…`);
+        try {
+          const fp = await acct.probeWsBalance();
+          if (fp && fp.ok) {
+            await client.reportAccount({
+              agent_id: cfg.agentId, account_id: acc.id,
+              info: { ws: {
+                remaining: fp.remaining, limit: fp.limit, spent: fp.spent,
+                reset_at: fp.resetAt, ts: now,
+              } },
+            }).catch(() => {});
+            log(`  [gs#${acc.id}] B 恢复探测：池余 $${fp.remaining}/$${fp.limit}`
+              + (acct.wsDisabled ? ' —— 仍不足，继续停用（跟踪下次重置）' : ' —— 已恢复可用'));
+          } else {
+            log(`  [gs#${acc.id}] B 恢复探测：余额未采到，下轮再试`, 'warn');
+          }
+        } catch (e) {
+          log(`  [gs#${acc.id}] B 恢复探测失败（下轮再试）：${e.message}`, 'warn');
+        }
+      }
+    } catch { /* 号池不可达：下轮再试 */ }
+  };
+  setInterval(gsWsResumeProbe, cfg.gensparkWsProbePollSeconds * 1000).unref();
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,14 +1126,20 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
       log(`  [gs#${accountId}] ✅ B 通道成功：model=${out.model} files=${out.filesWs}`
         + (out.freePool ? ` · 池余 $${out.freePool.remaining}/$${out.freePool.limit} · 重置 ${out.freePool.resetAt}` : ''));
       // B 通道余量快照顺手回报（fire-and-forget）：控制台账号行「通道B 免费池」
-      // 的数据源之一（巡检 6 小时一轮太稀，跑单后的快照更鲜）。
+      // 的数据源之一（巡检 6 小时一轮太稀，跑单后的快照更鲜）。带 disabled/
+      // resume_at —— 控制台「已停用/待恢复」徽标与租约排序（号池会按 remaining
+      // 重算权威值，这里只是让快照第一时间可显示）。
       // ⚠️ 只带 info 不带 ok/code —— 账号回报端点见到 ok/code 会重写验活结论。
-      if (out.freePool && out.freePool.ok) {
+      const wsSnap = acct.wsFreePool;
+      if (wsSnap && wsSnap.ok) {
         client.reportAccount({
           agent_id: cfg.agentId, account_id: accountId,
           info: { ws: {
-            remaining: out.freePool.remaining, limit: out.freePool.limit,
-            spent: out.freePool.spent, reset_at: out.freePool.resetAt,
+            remaining: wsSnap.remaining, limit: wsSnap.limit,
+            spent: wsSnap.spent, reset_at: wsSnap.resetAt,
+            disabled: acct.wsDisabled ? 1 : 0,
+            resume_at: acct.wsResumeAt || 0,
+            disable_note: acct.wsDisableNote || '',
             ts: Math.floor(Date.now() / 1000),
           } },
         }).catch(() => {});
@@ -1066,6 +1147,23 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     } catch (err) {
       if (err && err.errorKind === 'PARAM') throw err;   // 路由约束违规是节点 bug，直接暴露
       log(`  [gs#${accountId}] B 通道不可用（${String(err.message).slice(0, 140)}）→ 回落通道A`, 'warn');
+      // 🔴 B 失败也回报最新 B 池快照（fire-and-forget）：预检撞额度墙的路径
+      // 在 _applyWsSnapshot 里已判停用，这里把停用态捎回号池 —— 否则停用号
+      // 要等下一轮巡检才从 B 优先租约组里退场。
+      const wsSnap = acct.wsFreePool;
+      if (wsSnap && wsSnap.ok) {
+        client.reportAccount({
+          agent_id: cfg.agentId, account_id: accountId,
+          info: { ws: {
+            remaining: wsSnap.remaining, limit: wsSnap.limit,
+            spent: wsSnap.spent, reset_at: wsSnap.resetAt,
+            disabled: acct.wsDisabled ? 1 : 0,
+            resume_at: acct.wsResumeAt || 0,
+            disable_note: acct.wsDisableNote || '',
+            ts: Math.floor(Date.now() / 1000),
+          } },
+        }).catch(() => {});
+      }
       out = null;
     }
   }
