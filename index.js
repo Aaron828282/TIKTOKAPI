@@ -1197,6 +1197,25 @@ async function runGensparkTask(task, workerId) {
       state.presence = state.active.size ? 'busy' : 'idle';
       return;
     }
+    // 🔴 Plus 过期快速核验（2026-09-29 用户问询落地）：生图失败若不是额度墙 /
+    // cookie 失效 / 确定性失败，先花一次免费 GET /api/user 复核会员档 ——
+    // 非 Plus 立即回报（号池按 plan 自动停用），否则过期号要等最长 6h 巡检才停，
+    // 期间会被反复租出烧 failover 次数。复核本身失败不阻塞换号。
+    try {
+      const acct = gensparkPool.get(account.id, normalizeGsSession(r.session || {}));
+      const info = await acct.health();
+      const pl = String(info.plan || '').toLowerCase();
+      if (pl && pl !== 'plus' && pl !== 'pro' && pl !== 'team' && pl !== 'enterprise') {
+        await client.reportAccount({
+          agent_id: cfg.agentId, account_id: account.id, ok: false,
+          plan: pl,
+          message: `生图失败后复核会员档：plan=${pl} —— 非 Plus 不可生图，已自动停用`,
+        });
+        log(`[${workerId}] 账号 ${active.account} 复核为非 Plus（${pl}）→ 已回报停用，`
+          + `任务转下一个账号（${attempt}/${MAX_ATTEMPTS}）`, 'warn');
+        continue;
+      }
+    } catch { /* 复核失败（网络抖动等）：按普通换号处理，下轮巡检兜底 */ }
     // 其余（瞬时上游错误/网络抖动）：换下一个账号再试
     log(`[${workerId}] 账号 ${active.account} 执行失败[${out.error_kind}] → 换号重试：${out.error}`, 'warn');
   }
