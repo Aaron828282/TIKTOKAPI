@@ -1019,15 +1019,38 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   await beat('AGENT_RUNNING', 5);
   log(`  [gs#${accountId}] 提交：${model} · ${size} · ${aspect}`
     + ` · prompt=${prompt.slice(0, 50)}…`);
-  let out;
-  try {
-    out = await acct.generate({ prompt, model, size, aspect });
-  } catch (err) {
-    acct.lastError = `${err.name || 'Error'}: ${err.message}`.slice(0, 200);
-    // authExpired / quotaLimited 由上层 failover 识别处置；这里只留痕
-    if (err.authExpired) log(`  [gs#${accountId}] cookie 失效：${err.message}`, 'warn');
-    if (err.quotaLimited) log(`  [gs#${accountId}] ${err.message}`, 'warn');
-    throw err;
+
+  // 🔴 双通道路由（用户口径 2026-09-30，方案-双生图通道接入号池.md §一）：
+  //   通道A = ask_proxy SSE（5h 滚动额度，原有链路）
+  //   通道B = Super Agent WS 免费池（$N/窗口，额度独立；只接 1K——硬性准入）
+  // 规则：gpt-image-2/2.5 且 1K → 先检测 B 可用（余量预检 + 真跑）→ B 不可用
+  // 回落 A；2K/4K 或其他模型 → 只走 A（B 拿不到对应产物，纯浪费额度）。
+  // ⚠️ B 的失败（含免费池额度墙）不置账号休眠、不进 failover —— 免费池烧完
+  // 不代表通道 A 的 5h 额度也没了，A 链路照常跑，账号状态只由 A 决定。
+  let out = null;
+  const wsEligible = cfg.gensparkWsEnabled && size === '1K' && genspark.MODELS.has(model);
+  if (wsEligible) {
+    try {
+      log(`  [gs#${accountId}] 1K 任务：先试 WS 免费池通道（B）…`);
+      out = await acct.generateWs({ prompt, model, size, aspect });
+      log(`  [gs#${accountId}] ✅ B 通道成功：model=${out.model} files=${out.filesWs}`
+        + (out.freePool ? ` · 池余 $${out.freePool.remaining}/$${out.freePool.limit} · 重置 ${out.freePool.resetAt}` : ''));
+    } catch (err) {
+      if (err && err.errorKind === 'PARAM') throw err;   // 路由约束违规是节点 bug，直接暴露
+      log(`  [gs#${accountId}] B 通道不可用（${String(err.message).slice(0, 140)}）→ 回落通道A`, 'warn');
+      out = null;
+    }
+  }
+  if (!out) {
+    try {
+      out = await acct.generate({ prompt, model, size, aspect });
+    } catch (err) {
+      acct.lastError = `${err.name || 'Error'}: ${err.message}`.slice(0, 200);
+      // authExpired / quotaLimited 由上层 failover 识别处置；这里只留痕
+      if (err.authExpired) log(`  [gs#${accountId}] cookie 失效：${err.message}`, 'warn');
+      if (err.quotaLimited) log(`  [gs#${accountId}] ${err.message}`, 'warn');
+      throw err;
+    }
   }
   // 🔴 真实生效参数与请求参数对账（agent 会静默纠偏非法值）——落日志便于记账核查
   if (out.model !== model || out.size !== size) {
@@ -1057,6 +1080,8 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     // 真实生效的模型/档位（网站记账与展示以此为准，号池透传存进 result_json）
     result_model: out.model,
     result_size: out.size,
+    // 实际走的生图通道（ws=免费池B / browser=通道A）——号池与网站记账对账用
+    result_channel: out.channel || 'browser',
     fee: 0,
   };
 }
