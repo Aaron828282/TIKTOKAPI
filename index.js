@@ -1082,6 +1082,32 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   const size = String(task.image_resolution || '1K').trim().toUpperCase();
   const aspect = String(task.aspect_ratio || '1:1').trim();
 
+  // 🔴 参考图（2026-09-30 用户口径）：gs 两模型无论分辨率/尺寸都支持带图生图。
+  // 网站侧已放开（open-api 对 gs 透传 references），号池 image_urls 通用透传
+  // （aistudio 同款字段）。节点下载 → base64 data URL，A/B 两通道都按抓包
+  // 格式内嵌（B=sas.ask parts、A=ask_proxy content 数组）。上限 4 张（与
+  // aistudio 同口径；B 帧实测 2MB 级 data URL 可过，4 张 ~8MB 保守可行）。
+  const gsRefUrls = (task.image_urls || []).filter(Boolean).slice(0, 4);
+  const gsRefs = [];
+  if (gsRefUrls.length) {
+    await beat('UPLOADING', 3);
+    for (let i = 0; i < gsRefUrls.length; i += 1) {
+      const url = gsRefUrls[i];
+      log(`  [gs#${accountId}] 参考图 ${i + 1}/${gsRefUrls.length} 下载转码中…`);
+      const res = await fetch(url).catch((e) => {
+        throw new Error(`参考图 ${i + 1} 下载失败（${url.slice(0, 80)}）：${String(e.message || e)}`);
+      });
+      if (!res.ok) {
+        return failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+          `参考图 ${i + 1} 下载失败：HTTP ${res.status}（${url.slice(0, 80)}）`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      const mime = (String(res.headers.get('content-type') || '').split(';')[0]
+        || 'image/jpeg').trim();
+      gsRefs.push({ url: `data:${mime};base64,${buf.toString('base64')}`, mime, size: buf.length });
+    }
+  }
+
   // 🔴 全局 tab 排队闸（2026-09-28）：aistudio 与 genspark 共享整机
   // RH_TAB_LIMIT 个 tab。tab 满不判失败、排队等槽，每 5s beat 续命——
   // 等槽期间不发心跳就是 900s 被号池回收（初版 5 单全挂的教训）。
@@ -1107,6 +1133,7 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
 
   await beat('AGENT_RUNNING', 5);
   log(`  [gs#${accountId}] 提交：${model} · ${size} · ${aspect}`
+    + (gsRefs.length ? ` · ${gsRefs.length} 张参考图` : '')
     + ` · prompt=${prompt.slice(0, 50)}…`);
 
   // 🔴 双通道路由（用户口径 2026-09-30，方案-双生图通道接入号池.md §一）：
@@ -1122,7 +1149,7 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     try {
       log(`  [gs#${accountId}] 1K 任务：先试 WS 免费池通道（B）…`);
       await beat('AGENT_RUNNING', 5, 'ws');   // 选路即上报：控制台执行中就能看到通道
-      out = await acct.generateWs({ prompt, model, size, aspect });
+      out = await acct.generateWs({ prompt, model, size, aspect, refs: gsRefs });
       log(`  [gs#${accountId}] ✅ B 通道成功：model=${out.model} files=${out.filesWs}`
         + (out.freePool ? ` · 池余 $${out.freePool.remaining}/$${out.freePool.limit} · 重置 ${out.freePool.resetAt}` : ''));
       // B 通道余量快照顺手回报（fire-and-forget）：控制台账号行「通道B 免费池」
@@ -1170,7 +1197,7 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   if (!out) {
     await beat('AGENT_RUNNING', 5, 'browser');   // 通道A（或 B 回落后的实际通道）
     try {
-      out = await acct.generate({ prompt, model, size, aspect });
+      out = await acct.generate({ prompt, model, size, aspect, refs: gsRefs });
     } catch (err) {
       acct.lastError = `${err.name || 'Error'}: ${err.message}`.slice(0, 200);
       // authExpired / quotaLimited 由上层 failover 识别处置；这里只留痕
