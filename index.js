@@ -1566,28 +1566,55 @@ async function mirror(bytes, filename, taskId = '', { partIndex = 0, contentType
     }
   }
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), Math.max(10, cfg.mirrorTimeoutSeconds) * 1000);
-  let res;
-  try {
-    res = await fetch(cfg.mirrorUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': contentType,
-        'Content-Length': String(bytes.length),
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        ...(taskId ? { 'X-Relay-Task-Id': String(taskId) } : {}),
-        ...(partIndex >= 1 ? { 'X-Relay-Part-Index': String(partIndex) } : {}),
-        ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
-      },
-      body: bytes,
-      signal: ctrl.signal,
-    });
-  } catch (err) {
-    throw new Error(`转存请求失败（${cfg.mirrorUrl}）：${err.name === 'AbortError'
-      ? `超过 ${cfg.mirrorTimeoutSeconds}s 未完成` : err.message}`);
-  } finally {
-    clearTimeout(timer);
+  // 转存重试（2026-10-06）：图已生成后一次瞬时网络抖动不该判死整条任务
+  //（曾出现一次 fetch failed 直接终态 FAILED，成片白白丢弃）。网络级错误与
+  // 5xx 网关抖动都值得重试；4xx 是请求本身的问题，重试无意义。
+  const mirrorAttempts = Math.max(1, Number(cfg.mirrorRetryAttempts || 3));
+  const retryDelaysMs = [2000, 5000];
+  let res = null;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= mirrorAttempts; attempt += 1) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.max(10, cfg.mirrorTimeoutSeconds) * 1000);
+    try {
+      res = await fetch(cfg.mirrorUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': String(bytes.length),
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          ...(taskId ? { 'X-Relay-Task-Id': String(taskId) } : {}),
+          ...(partIndex >= 1 ? { 'X-Relay-Part-Index': String(partIndex) } : {}),
+          ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
+        },
+        body: bytes,
+        signal: ctrl.signal,
+      });
+      lastErr = null;
+      // 网关抖动（502/503/504）也重试；收到响应体前先别消费它。
+      if ([502, 503, 504].includes(res.status) && attempt < mirrorAttempts) {
+        const delay = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)];
+        log(`  转存 HTTP ${res.status}（第 ${attempt}/${mirrorAttempts} 次）—— ${delay / 1000}s 后重试`);
+        res = null;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < mirrorAttempts) {
+        const delay = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)];
+        log(`  转存网络错误（第 ${attempt}/${mirrorAttempts} 次，${err.name === 'AbortError' ? `超过 ${cfg.mirrorTimeoutSeconds}s 未完成` : err.message}）—— ${delay / 1000}s 后重试`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (lastErr && !res) {
+    throw new Error(`转存请求失败（${cfg.mirrorUrl}，已重试 ${mirrorAttempts} 次）：${lastErr.name === 'AbortError'
+      ? `超过 ${cfg.mirrorTimeoutSeconds}s 未完成` : lastErr.message}`);
   }
 
   const text = await res.text();
