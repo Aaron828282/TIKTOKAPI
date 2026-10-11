@@ -36,9 +36,10 @@
  *
  * 两个容易漏掉的职责
  * ------------------
- * 1. **取消检测**：号池 heartbeat 回的 `cancelled` 是硬编码 false 的桩，
- *    真正的判定在 `GET /api/v1/agent/task/{id}`。不问，控制台取消了任务
- *    节点也会跑到底 —— 白烧一次上游额度。见 executeTask 里的 peek。
+ * 1. **取消检测**：两条路 —— 视频链路轮询期间 peek（`GET /api/v1/agent/task/{id}`）；
+ *    生图链路（aistudio/genspark）用 makeImageCancelWatch（peek 轮询 + 心跳
+ *    回包的 cancelled 标志，号池 2026-10-11 起返回真实值）。发现判死立即
+ *    关页中止，白烧上游额度/挂满浏览器页面的事不再发生。
  * 2. **成品转存**：TikTok 的 `MainUrl` 必须带 Referer、且小时级过期，下游
  *    归档不了。交付只能走 mirror（见 README「成品回传」）。
  *
@@ -268,8 +269,16 @@ function makeBeater(taskId, active) {
     if (channel) hb.channel = channel;
 
     try {
-      await client.heartbeat(taskId, { status, progress, agentId: cfg.agentId, channel: channel || hb.channel || null });
+      const resp = await client.heartbeat(taskId, { status, progress, agentId: cfg.agentId, channel: channel || hb.channel || null });
       hb.fails = 0;
+      // 🔴 号池真实取消信号（2026-10-11）：任务已被号池判终态（生成硬上限 /
+      // 控制台取消 / 心跳超时收尸）时心跳回 cancelled=true。排队等待循环
+      // 据此立即退出，不再为死任务占着租号/排队位置。
+      if (resp && resp.cancelled) {
+        hb.cancelled = true;
+        log(`  号池心跳回报任务 ${taskId.slice(0, 8)}… 已被判终态（取消/超时收尸）—— 停止等待`, 'warn');
+      }
+      return resp;
     } catch (err) {
       hb.fails += 1;
       // 心跳连续失败不立刻放弃任务：号池可能只是在重启。
@@ -278,6 +287,47 @@ function makeBeater(taskId, active) {
       if (cfg.logLevel === 'debug') log(`  心跳失败：${err.message}`, 'debug');
     }
   };
+}
+
+// ---------------------------------------------------------------------------
+// 生图任务取消看门狗（2026-10-11）
+//
+// 背景：号池把任务强判终态（30 分钟生成硬上限 / 控制台取消 / 心跳超时收尸）
+// 后，生图执行面（aistudio / genspark）原本毫不知情 —— 生成期间不打心跳，
+// 浏览器 tab 继续挂着白烧上游额度，failover 循环还会接着换号重画死任务。
+//
+// 机制：peek 轮询（与视频链路同口径，号池 /agent/task/{id} 的 cancelled =
+// CANCEL/FAILED/AUDIT_FAILED）+ promise 触发器。lib 侧（aistudio.js /
+// genspark.js）拿到 `cancel.promise`，触发时立即关页 → 挂起的 evaluate /
+// RPC 等待全部 reject → finally 释放 tab —— 这就是「自动中断 + 清理 VPS
+// 浏览器」的执行点。执行器在 catch / 关键节点检查 watch.cancelled，回报
+// CANCELLED 失败（result 幂等，already_final 无害）。
+// ---------------------------------------------------------------------------
+function makeImageCancelWatch(taskId) {
+  const w = {
+    taskId,
+    cancelled: false,
+    promise: null,
+    _resolve: null,
+    _timer: null,
+  };
+  w.promise = new Promise((resolve) => { w._resolve = resolve; });
+  w.trigger = (reason) => {
+    if (w.cancelled) return;
+    w.cancelled = true;
+    log(`  任务 ${taskId.slice(0, 8)}… ${reason || '号池已判终态'} —— 自动中止并清理浏览器页面`, 'warn');
+    w._resolve();
+  };
+  if (cfg.peekSeconds > 0) {
+    w._timer = setInterval(() => {
+      client.peek(taskId)
+        .then((r) => { if (r && r.cancelled) w.trigger(`号池状态=${r.status || '终态'}`); })
+        .catch(() => { /* peek 抖动忽略，下一轮再问 */ });
+    }, Math.max(10, cfg.peekSeconds) * 1000);
+    if (w._timer.unref) w._timer.unref();
+  }
+  w.stop = () => { if (w._timer) { clearInterval(w._timer); w._timer = null; } };
+  return w;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,10 +437,9 @@ async function executeTask(task, session, beat, { lease = false, accountId = nul
 
   // 取消检测。
   //
-  // ⚠️ 号池 `/agent/heartbeat` 回的 `cancelled` 是**硬编码 false 的桩**
-  //    （agent_gateway.py），真正的判定在 `GET /api/v1/agent/task/{id}`。
-  //    所以这里必须自己问 —— 不问的话，控制台取消了任务，节点照样跑到底，
-  //    白烧一次上游额度（结果会被 `already_final` 丢掉，不出错，但钱花了）。
+  // 视频轮询期间用 peek（`GET /api/v1/agent/task/{id}`）问终态 —— 生图链路
+  // 另有 makeImageCancelWatch（peek 轮询 + 心跳回包 cancelled，2026-10-11 起
+  // 心跳返回真实值）。不问的话，号池判死了节点照样跑到底，白烧上游额度。
   //
   // `tiktok.poll` 的 onTick 是同步调用的，所以 peek 用「发出去、下一轮再看」
   // 的写法：不阻塞轮询，也让取消最多晚一个 interval 被发现。
@@ -933,7 +982,20 @@ if (cfg.aistudioEnabled) {
   setInterval(reconcile, 10 * 60_000).unref();
 }
 
+/**
+ * AI Studio 生图执行入口：挂取消看门狗（号池判终态 → 关页中止 + CANCELLED 回报），
+ * 执行体见 executeAistudioInner。
+ */
 async function executeAistudio(task, session, beat, { lease = false, accountId = null } = {}) {
+  const watch = makeImageCancelWatch(task.task_id);
+  try {
+    return await executeAistudioInner(task, session, beat, { lease, accountId }, watch);
+  } finally {
+    watch.stop();
+  }
+}
+
+async function executeAistudioInner(task, session, beat, { lease = false, accountId = null } = {}, watch) {
   const prompt = String(task.prompt || '').trim();
   if (!prompt) {
     return failure.localFailure(failure.KIND.PARAM, '生图任务提示词不能为空');
@@ -983,6 +1045,12 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
   // localFailure —— 并发略超 tab 数就整单失败退款，网站侧 10 并发需求必踩。
   // 现在领单后先等空闲 tab（每 5s 心跳续命 + 轮询），等 20 分钟仍无槽才认失败
   //（生图实测 ~1-2 分钟/单，20 分钟 = 队列里压 10+ 单也能消化）。
+  // 🔴 排队期上报 SUBMITTING（2026-10-11）：AGENT_RUNNING 在号池语义 =
+  // 「租到账号、开始生成」，首次上报会落 submitted_ts 启动 30 分钟生成硬
+  // 上限 —— 排队期上报会把它从「开始排队」起算，长队列必被误杀。
+  // SUBMITTING 只查心跳新鲜度，排队多久都不误伤（与视频租号等待同口径）。
+  // 等待期间随时检查取消信号（心跳回包 cancelled / peek 看门狗），号池判死
+  // 立即退出，不为死任务占队列。
   const tabDeadline = Date.now() + 20 * 60 * 1000;
   let queuedLogged = false;
   while (!acct.hasFreeTab()) {
@@ -990,11 +1058,19 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
       return failure.localFailure(failure.KIND.QUOTA,
         `生图通道繁忙：账号 #${accountId} 的 tab 持续占满（已排队 ${Math.round((Date.now() - (tabDeadline - 20 * 60 * 1000)) / 1000)}s），请稍后重试`);
     }
+    if (watch.cancelled) {
+      return failure.localFailure(failure.KIND.CANCELLED,
+        '号池已判该任务终态（超时/取消）—— 节点中止排队等待');
+    }
     if (!queuedLogged) {
       log(`  [ai#${accountId}] tab 全忙，任务排队等待空闲槽位（最长 20 分钟）…`);
       queuedLogged = true;
     }
-    await beat('AGENT_RUNNING', 5);
+    const hbResp = await beat('SUBMITTING', 5);
+    if (hbResp && hbResp.cancelled) {
+      return failure.localFailure(failure.KIND.CANCELLED,
+        '号池已判该任务终态（超时/取消）—— 节点中止排队等待');
+    }
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 
@@ -1005,8 +1081,16 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
     + (imageRes ? ` · ${imageRes}` : ''));
   let images;
   try {
-    images = await acct.generate({ prompt, imagePaths, aspect, resolution: imageRes });
+    // cancel.promise 传进执行面：触发时立即关页，挂起的 RPC 等待随之 reject
+    //（见 lib/aistudio.js _submitOnce）—— 生成期也能被自动中断。
+    images = await acct.generate({ prompt, imagePaths, aspect, resolution: imageRes, cancel: { promise: watch.promise } });
   } catch (err) {
+    // 号池判死 → 不区分底层错误形态，统一回报 CANCELLED（号池已是终态，
+    // 这条回报只会落 already_final，无副作用；价值在让节点日志可读）。
+    if (watch.cancelled) {
+      return failure.localFailure(failure.KIND.CANCELLED,
+        `号池已判该任务终态，节点中止生成（底层：${String(err.message || err).slice(0, 100)}）`);
+    }
     // cookie 失效要让号池看见（控制台标红 + 换号重试）。AuthExpiredError 带
     // upstreamCode=10001106，runTask 的 failover 会认出并走换号路径。
     if (err.authExpired) {
@@ -1018,6 +1102,10 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
     if (imagePaths.length) {
       try { nodeFs.rmSync(nodePath.dirname(imagePaths[0]), { recursive: true, force: true }); } catch { /* 幂等 */ }
     }
+  }
+  if (watch.cancelled) {
+    return failure.localFailure(failure.KIND.CANCELLED,
+      '号池已判该任务终态 —— 生成已完成但结果不再回报（任务已被判死）');
   }
 
   // 响应含 预览图 + 4K 成图 —— 交付最大的那张（用户口径：1 次调用 = 1 张 4K）
@@ -1062,7 +1150,20 @@ async function executeAistudio(task, session, beat, { lease = false, accountId =
 // 换稳定 URL，与 aistudio 交付完全同构。额度墙（5h 滚动窗口）抛
 // QuotaLimitError，由 runGensparkTask 的多账号 failover 接手。
 // ---------------------------------------------------------------------------
+/**
+ * Genspark 生图执行入口：挂取消看门狗（号池判终态 → 关页中止 + CANCELLED 回报），
+ * 执行体见 executeGensparkInner。
+ */
 async function executeGenspark(task, session, beat, { lease = false, accountId = null } = {}) {
+  const watch = makeImageCancelWatch(task.task_id);
+  try {
+    return await executeGensparkInner(task, session, beat, { lease, accountId }, watch);
+  } finally {
+    watch.stop();
+  }
+}
+
+async function executeGensparkInner(task, session, beat, { lease = false, accountId = null } = {}, watch) {
   const prompt = String(task.prompt || '').trim();
   if (!prompt) {
     return failure.localFailure(failure.KIND.PARAM, '生图任务提示词不能为空');
@@ -1112,6 +1213,9 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   // RH_TAB_LIMIT 个 tab。tab 满不判失败、排队等槽，每 5s beat 续命——
   // 等槽期间不发心跳就是 900s 被号池回收（初版 5 单全挂的教训）。
   // 等 20 分钟仍无槽才认失败（出图实测 30~60s/单，20 分钟够消化积压）。
+  // 🔴 排队期上报 SUBMITTING（2026-10-11，与 aistudio 同口径）：AGENT_RUNNING
+  // 会触发号池 30 分钟生成硬上限从排队起算 —— 排队期不算生成时间。
+  // 取消信号（心跳回包 / peek 看门狗）随时退出，不为死任务排队。
   const gsTabDeadline = Date.now() + 20 * 60 * 1000;
   let gsQueuedLogged = false;
   while (!acct.hasFreeTab()) {
@@ -1120,6 +1224,10 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
         `生图通道繁忙：全局 tab 持续占满（${cfg.tabPool ? `${cfg.tabPool.inUse}/${cfg.tabPool.limit}` : '?'}`
         + `，已排队 ${Math.round((Date.now() - (gsTabDeadline - 20 * 60 * 1000)) / 1000)}s），请稍后重试`);
     }
+    if (watch.cancelled) {
+      return failure.localFailure(failure.KIND.CANCELLED,
+        '号池已判该任务终态（超时/取消）—— 节点中止排队等待');
+    }
     if (!gsQueuedLogged) {
       const pool = cfg.tabPool;
       log(`  [gs#${accountId}] tab 全忙`
@@ -1127,7 +1235,11 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
         + '，任务排队等待空闲槽位（最长 20 分钟）…');
       gsQueuedLogged = true;
     }
-    await beat('AGENT_RUNNING', 5);
+    const hbResp = await beat('SUBMITTING', 5);
+    if (hbResp && hbResp.cancelled) {
+      return failure.localFailure(failure.KIND.CANCELLED,
+        '号池已判该任务终态（超时/取消）—— 节点中止排队等待');
+    }
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 
@@ -1150,7 +1262,12 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     try {
       log(`  [gs#${accountId}] ${size} 任务：先试 WS 免费池通道（B）…`);
       await beat('AGENT_RUNNING', 5, 'ws');   // 选路即上报：控制台执行中就能看到通道
-      out = await acct.generateWs({ prompt, model, size, aspect, refs: gsRefs });
+      // cancel 传进执行面：触发时强制关页，页内 WS / evaluate 挂起点全部 reject
+      out = await acct.generateWs({ prompt, model, size, aspect, refs: gsRefs, cancel: { promise: watch.promise } });
+      if (watch.cancelled) {
+        return failure.localFailure(failure.KIND.CANCELLED,
+          '号池已判该任务终态 —— B 通道出图但结果不再回报（任务已被判死）');
+      }
       log(`  [gs#${accountId}] ✅ B 通道成功：model=${out.model} files=${out.filesWs}`
         + (out.freePool ? ` · 池余 $${out.freePool.remaining}/$${out.freePool.limit} · 重置 ${out.freePool.resetAt}` : ''));
       // B 通道余量快照顺手回报（fire-and-forget）：控制台账号行「通道B 免费池」
@@ -1173,6 +1290,11 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
         }).catch(() => {});
       }
     } catch (err) {
+      // 号池判死 → 不回落通道A、不进 failover，直接 CANCELLED 终态
+      if (watch.cancelled) {
+        return failure.localFailure(failure.KIND.CANCELLED,
+          `号池已判该任务终态，节点中止生成（底层：${String(err.message || err).slice(0, 100)}）`);
+      }
       if (err && err.errorKind === 'PARAM') throw err;   // 路由约束违规是节点 bug，直接暴露
       log(`  [gs#${accountId}] B 通道不可用（${String(err.message).slice(0, 140)}）→ 回落通道A`, 'warn');
       // 🔴 B 失败也回报最新 B 池快照（fire-and-forget）：预检撞额度墙的路径
@@ -1198,14 +1320,22 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
   if (!out) {
     await beat('AGENT_RUNNING', 5, 'browser');   // 通道A（或 B 回落后的实际通道）
     try {
-      out = await acct.generate({ prompt, model, size, aspect, refs: gsRefs });
+      out = await acct.generate({ prompt, model, size, aspect, refs: gsRefs, cancel: { promise: watch.promise } });
     } catch (err) {
+      if (watch.cancelled) {
+        return failure.localFailure(failure.KIND.CANCELLED,
+          `号池已判该任务终态，节点中止生成（底层：${String(err.message || err).slice(0, 100)}）`);
+      }
       acct.lastError = `${err.name || 'Error'}: ${err.message}`.slice(0, 200);
       // authExpired / quotaLimited 由上层 failover 识别处置；这里只留痕
       if (err.authExpired) log(`  [gs#${accountId}] cookie 失效：${err.message}`, 'warn');
       if (err.quotaLimited) log(`  [gs#${accountId}] ${err.message}`, 'warn');
       throw err;
     }
+  }
+  if (watch.cancelled) {
+    return failure.localFailure(failure.KIND.CANCELLED,
+      '号池已判该任务终态 —— 生成已完成但结果不再回报（任务已被判死）');
   }
   // 🔴 真实生效参数与请求参数对账（agent 会静默纠偏非法值）——落日志便于记账核查
   if (out.model !== model || out.size !== size) {
@@ -1277,7 +1407,11 @@ async function runGensparkTask(task, workerId) {
     + `${task.image_resolution || '1K'} · prompt=${String(task.prompt || '').slice(0, 40)}…`);
 
   const MAX_ATTEMPTS = 5;
-  const LEASE_WAIT_MS = 15 * 60 * 1000;
+  // 🔴 租号等待上限（2026-10-11）：此前硬编码 15 分钟，账号池一忙就成批
+  // 「等待可用 Genspark 账号超时」。与视频链路 RH_LEASE_WAIT_MS 分开配置
+  //（生图不该等 6 小时，默认 45 分钟，覆盖「排队 + 30 分钟生成硬上限」）。
+  // 等待期间发 SUBMITTING 心跳（不触发号池 30 分钟生成硬上限）+ 检查取消。
+  const LEASE_WAIT_MS = Math.max(60 * 1000, Number(cfg.gensparkLeaseWaitMs) || 45 * 60 * 1000);
   const tried = [];
   let outcome = null;
   let lastFailureNote = '';
@@ -1297,6 +1431,7 @@ async function runGensparkTask(task, workerId) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS && !stopping; attempt += 1) {
     // ---- 租一个没试过的账号（exclude 已试清单；全忙/休眠时轮询等待） ----
     let r = null;
+    let hbResp = null;
     const leaseDeadline = Date.now() + LEASE_WAIT_MS;
     for (;;) {
       try {
@@ -1307,7 +1442,14 @@ async function runGensparkTask(task, workerId) {
       if (r && r.ok && r.session) break;
       if (Date.now() > leaseDeadline) {
         outcome = failure.localFailure(failure.KIND.UPSTREAM_ERROR,
-          `等待可用 Genspark 账号超时（15 分钟）—— 账号池全忙/休眠/凭据失效；请检查控制台账号状态`);
+          `等待可用 Genspark 账号超时（${Math.round(LEASE_WAIT_MS / 60000)} 分钟）—— 账号池全忙/休眠/凭据失效；请检查控制台账号状态`);
+        break;
+      }
+      // 🔴 号池判死即退出（2026-10-11）：心跳回包 cancelled=true 说明任务已被
+      // 号池判终态（30 分钟硬上限/取消/收尸）—— 继续租号重画是纯浪费。
+      if (hbResp && hbResp.cancelled) {
+        outcome = failure.localFailure(failure.KIND.CANCELLED,
+          '号池已判该任务终态（超时/取消）—— 节点中止租号等待');
         break;
       }
       // 🔴 号池明确「没有任何账号」时快速失败（否则干等 15 分钟，
@@ -1331,9 +1473,10 @@ async function runGensparkTask(task, workerId) {
       log(`[${workerId}] Genspark 账号全忙或休眠，${cfg.pollSeconds}s 后再试`
         + `（任务 ${tid} 不判失败，已试 ${tried.length} 个）`, 'warn');
       // 🔴 等待期间必须发心跳：900s 无心跳号池就判「心跳超时」回收任务
-      //（2026-09-28 初版 5 单全挂的根因之一）。
+      //（2026-09-28 初版 5 单全挂的根因之一）。状态用 SUBMITTING（还没租到
+      // 号开始生成，不触发号池 30 分钟生成硬上限）；回包带取消信号时立即终态。
       // eslint-disable-next-line no-await-in-loop
-      await beat('AGENT_RUNNING', 5);
+      hbResp = await beat('SUBMITTING', 5);
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, cfg.pollSeconds * 1000));
     }
@@ -1358,13 +1501,38 @@ async function runGensparkTask(task, workerId) {
       continue;
     }
 
-    await beat('AGENT_RUNNING', 5);
+    // SUBMITTING（2026-10-11）：租到号 ≠ 开始生成 —— executeGensparkInner 里
+    // 还有全局 tab 排队闸（最长 20 分钟）。若这里就报 AGENT_RUNNING，号池的
+    // 30 分钟生成硬上限会从排队前起算，长队列又被误杀。真正的 AGENT_RUNNING
+    // 基准由 inner 函数在拿到 tab、即将开跑时上报（那里落 submitted_ts）。
+    const preBeat = await beat('SUBMITTING', 5);
+    if (preBeat && preBeat.cancelled) {
+      await client.releaseSession({ taskId: tid, accountId: account.id }).catch(() => {});
+      outcome = failure.localFailure(failure.KIND.CANCELLED,
+        '号池已判该任务终态（超时/取消）—— 节点中止生成前等待');
+      break;
+    }
     log(`[${workerId}] 尝试 ${attempt}/${MAX_ATTEMPTS} · 账号 ${active.account}`
       + `（并发 ${r.account.running}/${r.account.max_slots}）`);
     let err = null;
     try {
       outcome = await executeGenspark(task, r.session, beat, { lease: true, accountId: account.id });
     } catch (e) { err = e; }
+
+    // ---- 执行器主动返回的失败结果（排队超限 / 取消 / 转存端点缺失等
+    // localFailure）：已是终态失败，直接回报收工 —— 尤其 CANCELLED 绝不许
+    // 进换号 failover（号池都判死了，换号重画是纯浪费）。（2026-10-11）
+    if (!err && outcome && outcome.ok === false) {
+      await client.releaseSession({ taskId: tid, accountId: account.id }).catch(() => {});
+      state.failed += 1;
+      const oerr = String(outcome.error || '').slice(0, 160);
+      state.lastTask = { taskId: tid, ok: false, detail: oerr, kind: outcome.error_kind || '', at: Date.now() };
+      log(`  ❌ ${oerr}`, outcome.cancelled ? 'warn' : 'error');
+      await report(tid, outcome);
+      state.active.delete(tid);
+      state.presence = state.active.size ? 'busy' : 'idle';
+      return;
+    }
 
     // ---- 成功：还槽收工 ----
     if (!err) {
