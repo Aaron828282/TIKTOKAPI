@@ -1840,7 +1840,11 @@ async function runTask(task, workerId) {
     + `prompt=${String(task.prompt || '').slice(0, 40)}…`);
 
   // ---- 租一个账号（占槽位）。幂等：同 task 再租返回原账号。 ----
-  const LEASE_WAIT_MS = 15 * 60 * 1000;   // 全忙时的最长等待；超时按执行失败处理
+  // 🔴 租号等待上限（2026-10-11 用户口径）：视频任务等可用账号最长 **6 小时**，
+  // 超时才判失败 —— 此前硬编码 15 分钟，并发一高排在后面的任务成批冤死。
+  // 等待期间每轮发 SUBMITTING 心跳（号池对 SUBMITTING 只查心跳新鲜度、
+  // 不套 30 分钟生成硬上限），否则 900s 无心跳会被号池提前收尸。
+  const LEASE_WAIT_MS = Math.max(60 * 1000, Number(cfg.leaseWaitMs) || 6 * 60 * 60 * 1000);
   let account = null;                      // { id, label }
   let session = null;                      // 租约带来的账号会话
   let lease = false;
@@ -1896,7 +1900,13 @@ async function runTask(task, workerId) {
         state.presence = state.active.size ? 'busy' : 'idle';
         return;
       }
-      log(`[${workerId}] 账号全忙，租不到号 —— ${cfg.pollSeconds}s 后再试（任务 ${tid} 不判失败）`, 'warn');
+      log(`[${workerId}] 账号全忙，租不到号 —— ${cfg.pollSeconds}s 后再试（任务 ${tid} 不判失败，最长等 6 小时）`, 'warn');
+      // 🔴 等待期间必须发心跳（SUBMITTING = 已接单、还没租到号开始生成）：
+      // 900s 无心跳号池会按「心跳超时」收尸；而 SUBMITTING 不套生成硬上限，
+      // 长时间排队等号不会被 30 分钟生成超时误杀。
+      // eslint-disable-next-line no-await-in-loop
+      await beat('SUBMITTING', 5);
+      // eslint-disable-next-line no-await-in-loop
       await tiktok.sleep(cfg.pollSeconds * 1000);
     }
   }
