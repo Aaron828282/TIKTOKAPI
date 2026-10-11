@@ -1136,18 +1136,19 @@ async function executeGenspark(task, session, beat, { lease = false, accountId =
     + (gsRefs.length ? ` · ${gsRefs.length} 张参考图` : '')
     + ` · prompt=${prompt.slice(0, 50)}…`);
 
-  // 🔴 双通道路由（用户口径 2026-09-30，方案-双生图通道接入号池.md §一）：
+  // 🔴 双通道路由（用户口径 2026-09-30；2026-10-11 更新）：
   //   通道A = ask_proxy SSE（5h 滚动额度，原有链路）
-  //   通道B = Super Agent WS 免费池（$N/窗口，额度独立；只接 1K——硬性准入）
-  // 规则：gpt-image-2/2.5 且 1K → 先检测 B 可用（余量预检 + 真跑）→ B 不可用
-  // 回落 A；2K/4K 或其他模型 → 只走 A（B 拿不到对应产物，纯浪费额度）。
+  //   通道B = Super Agent WS 免费池（$N/窗口，额度独立；2026-10-11 起放开 1K/2K/4K 全档）
+  // 规则：gpt-image-2/2.5 → 先检测 B 可用（余量预检 + 真跑）→ B 不可用回落 A；
+  // 其他模型 → 只走 A。网站侧 1K 任务已优先分流到 aicost 直连，这里收到的
+  // 2K/4K 占比上升 —— B 全档放开正好让免费池承接更多任务。
   // ⚠️ B 的失败（含免费池额度墙）不置账号休眠、不进 failover —— 免费池烧完
   // 不代表通道 A 的 5h 额度也没了，A 链路照常跑，账号状态只由 A 决定。
   let out = null;
-  const wsEligible = cfg.gensparkWsEnabled && size === '1K' && genspark.MODELS.has(model);
+  const wsEligible = cfg.gensparkWsEnabled && genspark.MODELS.has(model);
   if (wsEligible) {
     try {
-      log(`  [gs#${accountId}] 1K 任务：先试 WS 免费池通道（B）…`);
+      log(`  [gs#${accountId}] ${size} 任务：先试 WS 免费池通道（B）…`);
       await beat('AGENT_RUNNING', 5, 'ws');   // 选路即上报：控制台执行中就能看到通道
       out = await acct.generateWs({ prompt, model, size, aspect, refs: gsRefs });
       log(`  [gs#${accountId}] ✅ B 通道成功：model=${out.model} files=${out.filesWs}`
@@ -1281,14 +1282,14 @@ async function runGensparkTask(task, workerId) {
   let outcome = null;
   let lastFailureNote = '';
 
-  // 🔴 B 通道优先租号（2026-09-30 用户口径）：这单够 B 通道准入（WS 开启 +
-  // 1K + gpt-image 系模型）时，租号就带 prefer_ws —— 号池把「B 余额有剩」
-  // 的号排队首，且**余额重置越近越优先**（先烧快过期的免费池，避免重置
-  // 清零浪费）。选路兜底仍在 executeGenspark：租到的号 B 实际没额度就回落 A。
+  // 🔴 B 通道优先租号（2026-09-30 用户口径；2026-10-11 起不限分辨率档）：这单
+  // 够 B 通道准入（WS 开启 + gpt-image 系模型，全分辨率档）时，租号就带
+  // prefer_ws —— 号池把「B 余额有剩」的号排队首，且**余额重置越近越优先**
+  //（先烧快过期的免费池，避免重置清零浪费）。选路兜底仍在 executeGenspark：
+  // 租到的号 B 实际没额度就回落 A。
   const gsModel = String((task.agent || {}).model_id || 'gpt-image-2');
   const gsSize = String(task.image_resolution || '1K').trim().toUpperCase();
-  const preferWs = Boolean(cfg.gensparkWsEnabled) && gsSize === '1K'
-    && genspark.MODELS.has(gsModel);
+  const preferWs = Boolean(cfg.gensparkWsEnabled) && genspark.MODELS.has(gsModel);
   if (preferWs) {
     log(`[${workerId}] 任务 ${tid} 走 B 通道优先租号（号池按 B 余额重置时间升序挑号，先烧快过期的免费池）`);
   }
