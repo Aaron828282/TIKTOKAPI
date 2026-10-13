@@ -1248,16 +1248,19 @@ async function executeGensparkInner(task, session, beat, { lease = false, accoun
     + (gsRefs.length ? ` · ${gsRefs.length} 张参考图` : '')
     + ` · prompt=${prompt.slice(0, 50)}…`);
 
-  // 🔴 双通道路由（用户口径 2026-09-30；2026-10-11 更新）：
-  //   通道A = ask_proxy SSE（5h 滚动额度，原有链路）
-  //   通道B = Super Agent WS 免费池（$N/窗口，额度独立；2026-10-11 起放开 1K/2K/4K 全档）
-  // 规则：gpt-image-2/2.5 → 先检测 B 可用（余量预检 + 真跑）→ B 不可用回落 A；
-  // 其他模型 → 只走 A。网站侧 1K 任务已优先分流到 aicost 直连，这里收到的
-  // 2K/4K 占比上升 —— B 全档放开正好让免费池承接更多任务。
+  // 🔴 双通道路由（用户口径 2026-09-30；2026-10-13 分辨率守卫修订）：
+  //   通道A = ask_proxy SSE（5h 滚动额度，结构化 model_params.image_size，
+  //           分辨率有保证：09-29 实测 3:4+2K=1328×1760px）
+  //   通道B = Super Agent WS 免费池（$N/窗口，额度独立）
+  // ⟹ B 只承接 1K（2026-10-13）：B 没有结构化分辨率参数，档位只写在
+  //   自然语言提示词里，上游不保证（抓包文档第 18 条：4K 提示词实测只出
+  //   1360×768）。44f1623 曾放开 B 到 2K/4K，结果 2K/4K 任务全部被 B
+  //   「成功」出成 1K 图（用户 10-13 实测反馈）——免费池再香也不能拿
+  //   分辨率正确性换。2K/4K 直走 A；B 的原生输出恰好就是 1K 档。
   // ⚠️ B 的失败（含免费池额度墙）不置账号休眠、不进 failover —— 免费池烧完
   // 不代表通道 A 的 5h 额度也没了，A 链路照常跑，账号状态只由 A 决定。
   let out = null;
-  const wsEligible = cfg.gensparkWsEnabled && genspark.MODELS.has(model);
+  const wsEligible = cfg.gensparkWsEnabled && genspark.MODELS.has(model) && size === '1K';
   if (wsEligible) {
     try {
       log(`  [gs#${accountId}] ${size} 任务：先试 WS 免费池通道（B）…`);
@@ -1342,6 +1345,23 @@ async function executeGensparkInner(task, session, beat, { lease = false, accoun
     log(`  [gs#${accountId}] ⚠ 参数已被上游纠偏：请求 ${model}/${size} → 实际 ${out.model}/${out.size}`, 'warn');
   }
 
+  // 🔴 分辨率守卫（2026-10-13 用户实测反馈）：交付前用**真实像素**对账请求
+  // 档位——上游会静默降档（B 免费池提示词档位不保证；A 也可能纠偏）。
+  // 低于请求档还交付 = 用户按 2K/4K 价付费拿到 1K 图 → 拒绝交付、按上游
+  // 错误换号重试；连续 2 个账号同因降档 → 终态退款（再试只是烧额度）。
+  const tierRank = { '1K': 1, '2K': 2, '4K': 3 };
+  const actualTier = (out.dims && genspark.tierOf(out.dims)) || String(out.size || '').trim().toUpperCase();
+  if (tierRank[actualTier] !== undefined && tierRank[actualTier] < tierRank[size]) {
+    const e = new Error(`上游把 ${size} 任务降档出图：请求 ${size} · 实际 ${actualTier}`
+      + (out.dims ? `（${out.dims.w}×${out.dims.h}px）` : '')
+      + ' —— 拒绝交付劣质图，换号重试');
+    e.errorKind = 'UPSTREAM_ERROR';
+    e.resolutionShortfall = true;
+    throw e;
+  }
+  log(`  [gs#${accountId}] 出图对账：请求 ${size} · 实际 ${actualTier}`
+    + (out.dims ? `（${out.dims.w}×${out.dims.h}px）` : '') + ' ✓');
+
   await beat('UPLOADING', 92);
   const isPng = /png/i.test(out.contentType);
   const ext = isPng ? 'png' : 'jpg';
@@ -1415,15 +1435,15 @@ async function runGensparkTask(task, workerId) {
   const tried = [];
   let outcome = null;
   let lastFailureNote = '';
+  let resolutionShortfalls = 0;   // 分辨率守卫：连续降档计数（≥2 终态退款）
 
-  // 🔴 B 通道优先租号（2026-09-30 用户口径；2026-10-11 起不限分辨率档）：这单
-  // 够 B 通道准入（WS 开启 + gpt-image 系模型，全分辨率档）时，租号就带
-  // prefer_ws —— 号池把「B 余额有剩」的号排队首，且**余额重置越近越优先**
-  //（先烧快过期的免费池，避免重置清零浪费）。选路兜底仍在 executeGenspark：
-  // 租到的号 B 实际没额度就回落 A。
+  // 🔴 B 通道优先租号（2026-09-30 用户口径；2026-10-13 收口到 1K）：B 免费
+  // 池现在只承接 1K 任务（2K/4K 走 A，分辨率才有保证），非 1K 任务不再按
+  // prefer_ws 挑号——那会把「B 有余额」的号排到前面，扭曲 A 链路的租号次序。
   const gsModel = String((task.agent || {}).model_id || 'gpt-image-2');
   const gsSize = String(task.image_resolution || '1K').trim().toUpperCase();
-  const preferWs = Boolean(cfg.gensparkWsEnabled) && genspark.MODELS.has(gsModel);
+  const preferWs = Boolean(cfg.gensparkWsEnabled) && genspark.MODELS.has(gsModel)
+    && gsSize === '1K';
   if (preferWs) {
     log(`[${workerId}] 任务 ${tid} 走 B 通道优先租号（号池按 B 余额重置时间升序挑号，先烧快过期的免费池）`);
   }
@@ -1608,6 +1628,21 @@ async function runGensparkTask(task, workerId) {
       state.active.delete(tid);
       state.presence = state.active.size ? 'busy' : 'idle';
       return;
+    }
+    // 🔴 分辨率降档（2026-10-13 守卫）：上游把请求档位出成低档图 —— 换号
+    // 再试一次（可能是单号/单会话的偶发）；连续 2 个账号同因降档 = 上游当前
+    // 就不支持该档，继续换号只会把 5 个号各烧一遍额度，直接终态退款。
+    if (err.resolutionShortfall) {
+      resolutionShortfalls += 1;
+      if (resolutionShortfalls >= 2) {
+        outcome = failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+          `已连续 ${resolutionShortfalls} 个账号把 ${gsSize} 任务降档出图（上游当前不支持该分辨率档），`
+          + '拒绝交付劣质图 —— 星点将全额退还');
+        break;
+      }
+      log(`[${workerId}] 账号 ${active.account} 出图分辨率不足（请求 ${gsSize}）`
+        + ` → 换号重试（${attempt}/${MAX_ATTEMPTS}）：${out.error}`, 'warn');
+      continue;
     }
     // 🔴 Plus 过期快速核验（2026-09-29 用户问询落地）：生图失败若不是额度墙 /
     // cookie 失效 / 确定性失败，先花一次免费 GET /api/user 复核会员档 ——
