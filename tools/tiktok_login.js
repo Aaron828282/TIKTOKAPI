@@ -183,7 +183,7 @@ function fetchOtpCode(log) {
     let stdout = '';
     let done = false;
     const finish = (r) => { if (!done) { done = true; resolve(r); } };
-    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } finish(null); }, 300_000);  // 三级查箱（焦点/Other/Junk）需要 5min 预算
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } finish(null); }, 900_000);  // 验证码投递延迟实测 7~10 分钟（2026-10-13 实锤），v2 扫描预算 ~12 分钟，放宽到 15 分钟兜底
     child.stdout.on('data', (c) => { stdout += c; });
     child.on('error', (e) => { log(`接码器启动失败：${e.message}`); finish(null); });
     child.on('close', () => {

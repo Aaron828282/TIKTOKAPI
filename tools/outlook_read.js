@@ -96,99 +96,84 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc); }
     //    ① 焦点收件箱：轮询等 ≤4min 新邮件，~90s 后认命取最新
     //    ② 「其他」收件箱：Outlook 常把陌生发件人分到 Other
     //    ③ 垃圾邮件文件夹：新 Outlook 账号 TikTok 邮件高发进 Junk
-    const readList = () => page.$$eval('div[role="option"]', els => els.map(e => ({
-      label: e.getAttribute('aria-label') || '', text: (e.innerText || '').slice(0, 160),
-    })));
-    const ageMinutes = (s) => {
-      const t = s.toLowerCase();
-      if (/just now|\d+\s*second/.test(t)) return 0;
-      const mm = t.match(/(\d+)\s*min/);
-      if (mm) return parseInt(mm[1], 10);
-      return 999; // 钟点时间/Yesterday/日期 = 判不了或旧
-    };
-    const isCodeMail = (s) => /verif|code|验证/i.test(s);
-    let pickAge = 999, pickScore = 0;
-    const pickMail = async () => {
-      const items = await readList().catch(() => []);
-      let best = -1, bestScore = -1;
-      items.forEach((it, i) => {
-        const hay = it.label + ' ' + it.text;
-        if (!/tiktok/i.test(hay)) return;
-        const age = ageMinutes(hay);
-        const score = (age <= 4 ? 2 : 0) + (isCodeMail(hay) ? 1 : 0);
-        if (score > bestScore) { bestScore = score; best = i; pickAge = age; }
-      });
-      pickScore = best >= 0 ? bestScore : 0;
-      return best;
-    };
-    const waitList = async (ms) => {
-      await page.waitForTimeout(ms);
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
-    };
-    let hitIdx = -1, staleIdx = -1;
-    // —— ① 焦点收件箱（新邮件或带验证码关键词才收；旧欢迎邮件只记兜底）——
-    for (let poll = 0; poll < 4; poll++) {
-      hitIdx = await pickMail();
-      if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
-      if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
-      hitIdx = -1;
-      await waitList(12000);
-    }
-    // —— ② 「其他」收件箱（Focused/Other 切换，多选择器兜底，防静默失败）——
-    if (hitIdx < 0) {
-      const otherSels = [
-        'button:has-text("Other")', '[role="tab"]:has-text("Other")',
-        '[role="option"]:has-text("Other")', 'span:text-is("Other")',
-        'button:has-text("其他")', '[role="tab"]:has-text("其他")',
-      ];
-      for (const sel of otherSels) {
-        const okc = await page.click(sel, { timeout: 1200 }).then(() => true).catch(() => false);
-        if (okc) break;
-      }
-      await page.waitForTimeout(3000);
-      await page.waitForSelector('div[role="option"]', { timeout: 15000 }).catch(() => {});
-      for (let poll = 0; poll < 2; poll++) {
-        hitIdx = await pickMail();
-        if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
-        if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
-        hitIdx = -1;
-        await page.waitForTimeout(10000);
-      }
-    }
-    // —— ②.5 全局搜索（跨所有文件夹精确捞 TikTok 发件人，含 Other/Junk）——
-    //    发件人固定为 TikTok For Business，搜 "TikTok" 必中
-    if (hitIdx < 0) {
-      const box = page.locator('input[type="search"], input[aria-label*="earch" i], #topSearchInput').first();
-      await box.click({ timeout: 3000 }).catch(() => {});
-      await box.fill('TikTok').catch(() => {});
-      await page.keyboard.press('Enter').catch(() => {});
-      await page.waitForTimeout(5000);
-      await page.waitForSelector('div[role="option"]', { timeout: 15000 }).catch(() => {});
-      for (let poll = 0; poll < 3; poll++) {
-        hitIdx = await pickMail();
-        if (hitIdx >= 0 && (pickAge <= 4 || pickScore >= 1)) break;
-        if (hitIdx >= 0 && staleIdx < 0) staleIdx = hitIdx;
-        hitIdx = -1;
-        await page.waitForTimeout(8000);
-      }
-    }
-    // —— ③ 垃圾邮件文件夹 ——
-    if (hitIdx < 0) {
-      await page.goto('https://outlook.live.com/mail/0/junkemail', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
-      for (let poll = 0; poll < 3; poll++) {
-        hitIdx = await pickMail();
-        if (hitIdx >= 0) break;
-        await waitList(10000);
-      }
-    }
-    if (hitIdx < 0 && staleIdx >= 0) hitIdx = staleIdx; // 三级都没等到新邮件，认命用旧 TikTok 邮件
-    if (hitIdx < 0) {
-      const items = await readList().catch(() => []);
-      return out({ ok: false, stage: 'no-tiktok-mail', inbox_first3: items.slice(0, 3), _rc: 1 });
-    }
-    await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
+    // 3) 找最新一封 TikTok 验证码邮件 —— v2（2026-10-13 大改版）：
+//    ① 新邮件只落「Other」标签页（微软已把 TikTok 发件人分流出 Focused，
+//       Focused 里只剩 10-09 前的旧邮件）—— 每轮轮询前先确保切到 Other；
+//    ② 投递延迟实测 7~10 分钟（号池看板对照实锤）—— 轮询预算放宽到 ~12 分钟；
+//    ③ 时区无关的「位置增量」判定：进入时快照现有验证码邮件集合，轮询中
+//       出现集合外的新邮件才命中 —— 旧邮件的死码绝不再兜底（旧逻辑打开
+//       10-08 的旧邮件抓死码提交，被 TikTok 拒 → no-code / otp-stuck）。
+const readList = () => page.$$eval('div[role="option"]', els => els.map(e => ({
+  label: e.getAttribute('aria-label') || '', text: (e.innerText || '').slice(0, 200),
+})));
+const isCodeMail = (s) => /verif|code|验证/i.test(s);
+const snapKey = (it) => (it.label || '') + '|' + (it.text || '').slice(0, 60);
+const gotoOtherTab = async () => {
+  for (const sel of ['span:text-is("Other")', 'button:has-text("Other")', '[role="tab"]:has-text("Other")', 'span:text-is("其他")', 'button:has-text("其他")']) {
+    const okc = await page.click(sel, { timeout: 1500 }).then(() => true).catch(() => false);
+    if (okc) { await page.waitForTimeout(2500); return true; }
+  }
+  return false;
+};
+const snapFreshSet = async (set) => {
+  const items = await readList().catch(() => []);
+  items.forEach((it) => {
+    const hay = it.label + ' ' + it.text;
+    if (/tiktok/i.test(hay) && isCodeMail(hay)) set.add(snapKey(it));
+  });
+  return set;
+};
+// 基线 1：Other 收件箱现有验证码邮件 = 旧邮件
+let baselineSet = new Set();
+await gotoOtherTab();
+baselineSet = await snapFreshSet(baselineSet);
+// 基线 2：垃圾邮件文件夹（顺路快照，后面兜底扫描时同样只认新邮件）
+await page.goto('https://outlook.live.com/mail/0/junkemail', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+await page.waitForTimeout(2000);
+baselineSet = await snapFreshSet(baselineSet);
+await page.goto('https://outlook.live.com/mail/0/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+const freshFind = async () => {
+  const items = await readList().catch(() => []);
+  let hit = -1;
+  items.forEach((it, i) => {
+    const hay = it.label + ' ' + it.text;
+    if (hit >= 0) return;
+    if (!/tiktok/i.test(hay) || !isCodeMail(hay)) return;
+    if (baselineSet.has(snapKey(it))) return;      // 快照里已有 = 旧邮件，跳过
+    hit = i;                                        // 列表 newest-first，取第一条新邮件
+  });
+  return hit;
+};
+let hitIdx = -1;
+for (let poll = 0; poll < 34 && hitIdx < 0; poll++) {
+  await gotoOtherTab();
+  hitIdx = await freshFind();
+  if (hitIdx >= 0) break;
+  await page.waitForTimeout(20000);
+  // 每 3 轮强刷一次（防 live-update 失灵）；窗口尾声把垃圾箱也扫一遍（同样只认新邮件）
+  if (poll % 3 === 2) {
+    await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+  }
+  if (poll === 27) {
+    await page.goto('https://outlook.live.com/mail/0/junkemail', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    hitIdx = await freshFind();
+    if (hitIdx >= 0) break;
+    await page.goto('https://outlook.live.com/mail/0/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await page.waitForSelector('div[role="option"]', { timeout: 30000 }).catch(() => {});
+  }
+}
+if (hitIdx < 0) {
+  const items = await readList().catch(() => []);
+  return out({ ok: false, stage: 'no-fresh-code',
+    error: '等待约 12 分钟未出现新验证码邮件（Other 收件箱 + 垃圾箱均无）。投递延迟 7~10 分钟属正常，持续缺码多为 TikTok 侧限频静默丢弃。',
+    inbox_first3: items.slice(0, 3), _rc: 1 });
+}
+await page.$$eval('div[role="option"]', (els, i) => els[i].click(), hitIdx);
     await page.waitForTimeout(3000);
     // 4) 读正文抓 6 位码
     const body = await page.evaluate(() => {
