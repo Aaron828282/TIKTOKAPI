@@ -206,6 +206,8 @@ const server = http.createServer((req, res) => {
       // 并发观测（lease 版）：running = 正在执行的任务数，active = 每条的明细
       mode: 'lease',
       concurrency: cfg.maxConcurrent,
+      // 下载窗口并发闸观测（2026-10-14）：如 "3/10（排队 7）"
+      download_gate: cfg.downloadGate.view(),
       running: state.active.size,
       active: [...state.active.values()],
       // 兼容旧观测口：取第一条在跑的
@@ -592,16 +594,27 @@ async function executeTask(task, session, beat, { lease = false, accountId = nul
       log('  ⚠️ ' + archiveNote, 'warn');
     } else {
       try {
-        log('  下载成片并转存（mirror 模式）…');
-        const bytes = await tiktok.download(result.bestUrl, cfg);
-        log(`  已下载 ${(bytes.length / 1048576).toFixed(2)}MB，POST 给收件端 …`);
-        // ⚠️ 文件名必须用**号池任务号**（`task.task_id`），不是 `result.taskId`。
-        // `result.taskId` 是 TikTok 侧的任务号（也就是回报里的 remote_task_id），
-        // 号池把它对客户隐藏，网站拿不到、无法反查用户 —— 收件方按它落库会变成孤儿资产。
-        // 号池任务号 = 网站 generation_jobs.upstream_task_id，收件方可以据此确认归属。
-        outputUrl = await mirror(bytes, `${task.task_id}.mp4`, task.task_id);
-        archived = true;
-        log(`  已转存 → ${outputUrl.slice(0, 100)}`);
+        // 🔴 下载窗口并发闸（2026-10-14 用户口径）：整段「下载成片+转存」
+        // 持有全局信号量槽位（默认 10）。领单不设上限，但字节缓冲只允许
+        // 10 条同时在飞 —— 先完成先占槽（FIFO 按生成完成时间排队），同时
+        // 完成的在队列里竞争。排队的任务只等一个 Promise，内存≈0。
+        await cfg.downloadGate.acquire();
+        try {
+          const queued = cfg.downloadGate.waiting;
+          log(`  下载成片并转存（mirror 模式 · 下载闸 ${cfg.downloadGate.view()}）…`);
+          const bytes = await tiktok.download(result.bestUrl, cfg);
+          log(`  已下载 ${(bytes.length / 1048576).toFixed(2)}MB，POST 给收件端 …`);
+          // ⚠️ 文件名必须用**号池任务号**（`task.task_id`），不是 `result.taskId`。
+          // `result.taskId` 是 TikTok 侧的任务号（也就是回报里的 remote_task_id），
+          // 号池把它对客户隐藏，网站拿不到、无法反查用户 —— 收件方按它落库会变成孤儿资产。
+          // 号池任务号 = 网站 generation_jobs.upstream_task_id，收件方可以据此确认归属。
+          outputUrl = await mirror(bytes, `${task.task_id}.mp4`, task.task_id);
+          archived = true;
+          log(`  已转存 → ${outputUrl.slice(0, 100)}`
+            + (queued ? `（此前排队 ${queued} 条）` : ''));
+        } finally {
+          cfg.downloadGate.release();
+        }
       } catch (err) {
         archiveNote = `转存失败（${err.message}）—— 已降级为直链交付，任务仍算成功`;
         log('  ⚠️ ' + archiveNote, 'warn');
