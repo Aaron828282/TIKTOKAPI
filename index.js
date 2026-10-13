@@ -2273,6 +2273,35 @@ async function runTask(task, workerId) {
         log(`[${workerId}] 池内无其他可用账号，任务 ${tid} 按限流失败处理`, 'warn');
         throw err;
       }
+      // 🔴 Dreamina 按天次数额度耗尽分支（2026-10-14 用户口径）：10040104 连续
+      // 重试仍被拒 = 该账号该模型今日额度真耗尽（每日 08:00 CST 重置）。处置：
+      //   ① 还槽 → exclude 排除该号再租 → 换号重试一次（上游未建单，重提安全）；
+      //   ② **不回报 sleep_until**：额度按模型分档（Mini/2.0/Fast 各自独立），
+      //      账号级休眠会把其他模型还有额度的号也错杀 —— 号池侧的「模型日额度
+      //      优先排序」靠下一轮 info 采集（30 分钟）自动纠正，这里只管把本单救走。
+      // 池内没有其他可用号时才按 QUOTA 上抛判失败。
+      if (lease && account && err.accountDayLimited && !err.remoteTaskId) {
+        const deadId = account.id;
+        log(`[${workerId}] 账号 #${deadId} 该模型今日次数额度已耗尽 —— 还槽并尝试换号重试一次`, 'warn');
+        try { await client.releaseSession({ taskId: tid, accountId: deadId }); } catch { /* 幂等 */ }
+        let r2 = null;
+        try {
+          r2 = await client.leaseSession({ backend, taskId: tid, exclude: [deadId] });
+        } catch (e3) { log(`[${workerId}] 额度换号租约失败：${e3.message}`, 'warn'); }
+        if (r2 && r2.ok && r2.session) {
+          try {
+            session = backend === 'aistudio_image'
+              ? normalizeAiSession(r2.session)
+              : normalizeSession(r2.session);
+          } catch (e4) { throw err; }
+          account = { id: r2.account.id, label: r2.account.label || '' };
+          active.account = account.label || `#${account.id}`;
+          log(`[${workerId}] 已换到账号 ${active.account}，重试提交（原号当日额度耗尽）`, 'info');
+          return executeTask(task, session, beat, { lease: true, accountId: account.id });
+        }
+        log(`[${workerId}] 池内无其他可用账号，任务 ${tid} 按额度失败处理（等额度重置后可重新发起）`, 'warn');
+        throw err;
+      }
       // 只有「提交阶段会话失效且上游未建单」才值得换号重试 ——
       // 带着 remoteTaskId 说明单已建、钱已花，换号重提等于第二单。
       if (!lease || !account || !sessionruntime.isAuthExpired(err) || err.remoteTaskId) throw err;
