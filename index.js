@@ -1972,25 +1972,70 @@ async function loop() {
 
   // ---- 并发取活 ----
   //
-  // lease 版：maxConcurrent 个 worker 各自「claim → 租号 → 执行 → 还槽 → 回报」。
+  // lease 版：worker 各自「claim → 租号 → 执行 → 还槽 → 回报」。
   // 每个任务在 lease 那一刻绑定一个账号（占一个槽位），同一账号最多
   // max_slots 个任务同时跑 —— 号池控制台的「账号槽位」「并发槽位」两块
   // 显示的就是这套租约的实时状态。
-  log(`并发 worker × ${cfg.maxConcurrent}（RH_MAX_CONCURRENT 可调；`
-    + `单账号并发上限 5，多账号时建议设为 账号数 × 5）`);
+  //
+  // 🔴 两种池模式（2026-10-14 用户口径）：
+  //   · 分池模式 —— 任一 RH_*_MAX_CONCURRENT 非 0 时启用：每个已声明 backend
+  //     一条独立池，互不挤占。理由：TikTok r2v 是纯 HTTP 执行面，不该跟
+  //     Gemini（每 worker 一个有头 Chromium tab）共享槽位，混合池会出现
+  //     「生图占满 8 槽、视频单干等」的互相挤占。
+  //       - RH_TIKTOK_MAX_CONCURRENT=-1 → TikTok **不设上限**（claim 即派发：
+  //         领到任务立刻丢给后台执行、派发循环马上去领下一条。真实并发由
+  //         号池「每账号 max_slots × 账号数」决定，节点不再卡口）；
+  //       - >0 → 固定池（熔断保险丝）；0（未设）→ 继承 RH_MAX_CONCURRENT。
+  //   · 混合模式 —— 三个变量全为 0 时保持旧行为（maxConcurrent 个混合
+  //     worker claim 全部 backends），老部署零影响。
+  const perBackend = {
+    tiktok_r2v: cfg.tiktokMaxConcurrent,
+    aistudio_image: cfg.aistudioMaxConcurrent,
+    genspark_image: cfg.gensparkMaxConcurrent,
+  };
+  const splitMode = Object.values(perBackend).some((v) => v !== 0);
+
   const workers = [];
-  for (let i = 1; i <= cfg.maxConcurrent; i += 1) {
-    workers.push(workerLoop(i));
+  if (splitMode) {
+    const describe = (b, n) => (n === -1 ? `${b}: 不设上限（claim 即派发）` : `${b}: × ${n}`);
+    const lines = [];
+    for (const backend of cfg.backends) {
+      const v = Object.prototype.hasOwnProperty.call(perBackend, backend) ? perBackend[backend] : 0;
+      const count = v === 0 ? cfg.maxConcurrent : v;   // 未设 → 继承混合池的缺省
+      if (count === -1) {
+        lines.push(describe(backend, -1));
+        // 2 个派发循环互为冗余：领到即派发（不 await runTask）， busy 时
+        // 派发速率 ≈ claim 往返时延，任务洪峰也能秒级铺开。
+        for (let i = 1; i <= 2; i += 1) {
+          workers.push(dispatcherLoop(`${backend}#dispatch${i}`, backend));
+        }
+      } else {
+        lines.push(describe(backend, count));
+        for (let i = 1; i <= count; i += 1) {
+          workers.push(workerLoop(`${backend}#${i}`, backend));
+        }
+      }
+    }
+    log(`分池模式（RH_TIKTOK/AISTUDIO/GENSPARK_MAX_CONCURRENT；`
+      + `纯 HTTP 的 TikTok 池与浏览器池互不挤占）—— ${lines.join(' · ')}`);
+  } else {
+    log(`并发 worker × ${cfg.maxConcurrent}（RH_MAX_CONCURRENT 可调；`
+      + `单账号并发上限 5，多账号时建议设为 账号数 × 5）`);
+    for (let i = 1; i <= cfg.maxConcurrent; i += 1) {
+      workers.push(workerLoop(i));
+    }
   }
   await Promise.all(workers);
 }
 
-/** 单个 worker：空闲时轮询 claim，领到就交给 runTask 串完整条生命周期。 */
-async function workerLoop(workerId) {
+/** 单个 worker：空闲时轮询 claim，领到就交给 runTask 串完整条生命周期。
+ *  backend 非空 = 分池模式：只 claim 这一个 backend（池间互不挤占）。 */
+async function workerLoop(workerId, backend = '') {
+  const claimBackends = backend ? [backend] : cfg.backends;
   while (!stopping) {
     let task = null;
     try {
-      const got = await client.claim(cfg.agentId, cfg.backends);
+      const got = await client.claim(cfg.agentId, claimBackends);
       task = got && got.task;
     } catch (err) {
       state.lastError = err.message;
@@ -2005,6 +2050,47 @@ async function workerLoop(workerId) {
     }
 
     await runTask(task, workerId);
+  }
+}
+
+/**
+ * 无上限派发循环（2026-10-14 用户口径，TikTok 纯 HTTP 执行面专用形态）：
+ * claim 到任务立刻丢给后台执行（不 await），随即回去领下一条 —— 节点侧
+ * 不设并发上限，真实并发由号池的账号槽位（每账号 max_slots × 账号数）卡。
+ * 两个循环实例互为冗余，任一意外崩溃另一个仍在派发。
+ */
+async function dispatcherLoop(workerId, backend) {
+  const claimBackends = [backend];
+  while (!stopping) {
+    let task = null;
+    try {
+      const got = await client.claim(cfg.agentId, claimBackends);
+      task = got && got.task;
+    } catch (err) {
+      state.lastError = err.message;
+      log(`[${workerId}] 领取任务失败：${err.message}`, 'warn');
+      // eslint-disable-next-line no-await-in-loop
+      await tiktok.sleep(cfg.pollSeconds * 1000);
+      continue;
+    }
+
+    if (!task) {
+      // eslint-disable-next-line no-await-in-loop
+      await tiktok.sleep(cfg.pollSeconds * 1000);
+      continue;
+    }
+
+    // 🔴 不 await：任务生命周期交给后台，派发循环立刻去领下一条。
+    // runTask 内部已兜底回报终态；这里再挂一层 catch 防意外上抛
+    //（未处理的 rejection 在 node 15+ 会直接掀翻整个进程）。
+    runTask(task, workerId).catch((err) => {
+      state.lastError = err.message;
+      log(`[${workerId}] 任务 ${task.task_id} 执行循环意外抛错：${err.message}`, 'error');
+    });
+    // 轻微节流：任务洪峰时别把 claim 打成空转热循环（派发速率 ≈ 4 条/秒
+    // 起步，200 条积压约 1 分钟内全部铺开；空队列时仍按 pollSeconds 慢轮询）。
+    // eslint-disable-next-line no-await-in-loop
+    await tiktok.sleep(250);
   }
 }
 
@@ -2133,6 +2219,47 @@ async function runTask(task, workerId) {
       // （2026-09-26 首单失败根因 —— 租到号却没把 id 带进执行函数，防呆拦下）。
       return await executeTask(task, session, beat, { lease, accountId: account && account.id });
     } catch (err) {
+      // 🔴 429 账号限流分支（2026-10-14 用户口径）：Gemini Pro 撞 429 = 该
+      // Google 账号被上游限流。处置不是把任务判死，而是——
+      //   ① 回报号池 sleep_until=now+3600：账号休息 1 小时（sleep_until 租约闸
+      //      是 backend 无关的通用机制，号池零改动；到点自动恢复接单）；
+      //   ② 还槽 → exclude 排除该号再租 → 换号重试一次（429 发生在提交阶段、
+      //      上游未建单未扣额度，重提安全）。
+      // 换不到别的号（只有这一个账号）时才把原 429 错误上抛判失败。
+      if (lease && account && err.accountRateLimited && !err.remoteTaskId) {
+        const deadId = account.id;
+        const sleepUntil = Math.floor(Date.now() / 1000) + 3600;
+        log(`[${workerId}] 账号 #${deadId} 撞上游 429 限流 —— 回报休息 1 小时（sleep_until）`
+          + `并尝试换号重试一次`, 'warn');
+        try {
+          await client.reportAccount({
+            agent_id: cfg.agentId, account_id: deadId,
+            ok: false, code: 'AISTUDIO_429',
+            sleep_until: sleepUntil,
+            message: String(err.message).slice(0, 300),
+          });
+        } catch (e2) { log(`[${workerId}] 限流休眠回报失败：${e2.message}`, 'warn'); }
+        try { await client.releaseSession({ taskId: tid, accountId: deadId }); } catch { /* 幂等 */ }
+        let r2 = null;
+        try {
+          r2 = await client.leaseSession({ backend, taskId: tid, exclude: [deadId] });
+        } catch (e3) { log(`[${workerId}] 限流换号租约失败：${e3.message}`, 'warn'); }
+        if (r2 && r2.ok && r2.session) {
+          try {
+            session = backend === 'aistudio_image'
+              ? normalizeAiSession(r2.session)
+              : normalizeSession(r2.session);
+          } catch (e4) { throw err; }
+          account = { id: r2.account.id, label: r2.account.label || '' };
+          active.account = account.label || `#${account.id}`;
+          log(`[${workerId}] 已换到账号 ${active.account}，重试提交（429 时上游未建单，安全）`, 'info');
+          return executeTask(task, session, beat, { lease: true, accountId: account.id });
+        }
+        // 池子里没有其他可用账号 —— 原 429 上抛，按 QUOTA 类失败进控制台
+        //（号池侧该账号已带 sleep_until 休眠 1h，任务不会立刻重撞同一个号）。
+        log(`[${workerId}] 池内无其他可用账号，任务 ${tid} 按限流失败处理`, 'warn');
+        throw err;
+      }
       // 只有「提交阶段会话失效且上游未建单」才值得换号重试 ——
       // 带着 remoteTaskId 说明单已建、钱已花，换号重提等于第二单。
       if (!lease || !account || !sessionruntime.isAuthExpired(err) || err.remoteTaskId) throw err;
