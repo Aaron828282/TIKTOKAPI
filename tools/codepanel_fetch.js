@@ -25,8 +25,11 @@
  * 对接要点（对照《对外开放API.md》2026-10-14 版实测）：
  *   · slug = 邮箱 local part，但**不要自己拼** —— 从 /api/accounts 按邮箱
  *     大小写不敏感精确匹配拿权威 slug（防大小写差异 404）。
- *   · 面板后台每 45s 自动同步一轮，取码有 ~45-70s 延迟 → 轮询 5s/次、
- *     预算 240s（与登录器给接码器的 300s 预算对齐）。
+ *   · ⚠️ 面板后台同步是**每轮只轮 1 个账号**的 round-robin（85 个账号轮一圈
+ *     要好几分钟，2026-10-14 #29 实锤：码 11:47 进收件箱，节点等到 11:51
+ *     面板索引还是 1 小时前）。所以轮询期间必须每 SYNC_EVERY 秒主动
+ *     `POST /api/sync {"slug": <单账号>, "days":1, "limit":100}` 插队刷新
+ *     **这一个账号**的索引（异步接口，409=上一轮还在跑，无害跳过）。
  *   · /api/latest 的 age_seconds 防「旧码误用」：只收 age ≤ max-age 的码。
  */
 'use strict';
@@ -46,6 +49,7 @@ const WITHIN = numArg('within', 10);      // /api/latest 时间窗（分钟）
 const MAX_AGE = numArg('max-age', 240);   // 只收比这新的码（秒），防旧码
 const INTERVAL = numArg('interval', 5);   // 轮询间隔（秒）
 const BUDGET = numArg('budget', 240);     // 总预算（秒）
+const SYNC_EVERY = numArg('sync-every', 20); // 定向同步插队间隔（秒）
 
 const BASE = (process.env.RH_CODEPANEL_URL || '').trim().replace(/\/+$/, '');
 const USER = process.env.RH_CODEPANEL_USER || '';
@@ -72,6 +76,38 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc || (o
       return { status: r.status, body };
     } finally { clearTimeout(t); }
   }
+  async function postJson(url, payload, timeoutMs = 15000) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {}), signal: ctl.signal,
+      });
+      const txt = await r.text();
+      let body = null;
+      try { body = JSON.parse(txt); } catch { /* 非 JSON 原样返回 null */ }
+      return { status: r.status, body };
+    } finally { clearTimeout(t); }
+  }
+
+  // 定向同步插队：面板后台是「每轮 1 个账号」的 round-robin，85 个账号轮
+  // 一圈要几分钟 —— 不插队的话，等它轮到本账号时我们的预算早烧完了。
+  // POST /api/sync 异步启动单个账号的同步（409 = 上一轮手动同步还在跑，无害）。
+  let lastSyncAt = 0;
+  let syncOk = 0;
+  let syncErr = '';
+  async function nudgeSync() {
+    const now = Date.now();
+    if (now - lastSyncAt < SYNC_EVERY * 1000) return;
+    lastSyncAt = now;
+    try {
+      const r = await postJson(BASE + '/api/sync', { slug, days: 1, limit: 100 });
+      if (r.status === 200 || r.status === 409) { syncOk++; syncErr = ''; return; }
+      syncErr = 'HTTP ' + r.status + (r.body && r.body.error ? ' ' + r.body.error : '');
+    } catch (e) { syncErr = e.message; }
+  }
 
   // 1) 解析 slug：/api/accounts 按 email 大小写不敏感精确匹配
   let slug = '';
@@ -89,10 +125,11 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc || (o
     out({ ok: false, stage: 'panel-error', error: '接码平台不可达：' + e.message, _rc: 2 });
   }
 
-  // 2) 轮询 /api/latest 直到预算耗尽
+  // 2) 轮询 /api/latest 直到预算耗尽；每 SYNC_EVERY 秒插队一次定向同步
   const t0 = Date.now();
   let lastNote = '';
   while ((Date.now() - t0) / 1000 < BUDGET) {
+    await nudgeSync();
     try {
       const url = BASE + '/api/latest?account=' + encodeURIComponent(slug)
         + '&within=' + WITHIN + '&code_only=1';
@@ -117,7 +154,8 @@ function out(obj) { console.log(JSON.stringify(obj)); process.exit(obj._rc || (o
     await new Promise((res) => setTimeout(res, INTERVAL * 1000));
   }
   out({ ok: false, stage: 'no-code',
-    error: '接码平台 ' + BUDGET + 's 内未取到新码（' + lastNote + '）', _rc: 1 });
+    error: '接码平台 ' + BUDGET + 's 内未取到新码（' + lastNote
+      + '；定向同步 ' + syncOk + ' 次' + (syncErr ? '，最近异常：' + syncErr : '') + '）', _rc: 1 });
 })().catch((e) => {
   console.log(JSON.stringify({ ok: false, stage: 'crash', error: e.message, _rc: 2 }));
   process.exit(2);
