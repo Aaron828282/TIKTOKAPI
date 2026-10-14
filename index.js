@@ -1732,7 +1732,7 @@ async function ossDirectDeliver(bytes, taskId, { partIndex = 0, contentType = 'v
   if (!sign.upload_url) throw new Error('oss-sign 响应里没有 upload_url');
 
   // PUT 超时按体积缩放：实测 Hostinger→OSS ~55KB/s，24MB 上限要 445s；
-  // 按 25KB/s 慢速留裕量（+120s 握手/首字节），上限 1800s（任务总超时 5100s 兜底）。
+  // 按 25KB/s 慢速留裕量（+120s 握手/首字节），上限 1800s（任务总超时 7200s 兜底）。
   const putTimeoutSeconds = Math.min(1800, Math.max(600, Math.ceil(bytes.length / (25 * 1024)) + 120));
   const putCtrl = new AbortController();
   const putTimer = setTimeout(() => putCtrl.abort(), putTimeoutSeconds * 1000);
