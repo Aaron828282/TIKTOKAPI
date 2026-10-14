@@ -1093,6 +1093,14 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
     + (aspect ? ` · ${aspect}` : '')
     + (imageRes ? ` · ${imageRes}` : ''));
   let images;
+  // 🔴 生成期保活心跳（1015 用户定版）：generate() 内部可能蹲登录错峰闸
+  // 6~12 分钟（Google 踢登录态后自动重登），此前这段时间无人发心跳 —— 号池
+  // 900s 心跳判定一到，就把还活着、正在自动修复的任务误降级成 MONITORING
+  // 兜底干等 2 小时。现在每 60s 一次保活心跳，任务不再被误判；真死了才走兜底。
+  const hbTimer = setInterval(() => {
+    beat('AGENT_RUNNING', 5).catch(() => {});
+  }, 60 * 1000);
+  if (hbTimer.unref) hbTimer.unref();
   try {
     // cancel.promise 传进执行面：触发时立即关页，挂起的 RPC 等待随之 reject
     //（见 lib/aistudio.js _submitOnce）—— 生成期也能被自动中断。
@@ -1111,6 +1119,7 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
     }
     throw err;
   } finally {
+    clearInterval(hbTimer);
     // 临时参考图无论成败都清掉：托管平台磁盘不可靠，别留垃圾
     if (imagePaths.length) {
       try { nodeFs.rmSync(nodePath.dirname(imagePaths[0]), { recursive: true, force: true }); } catch { /* 幂等 */ }
@@ -2320,6 +2329,13 @@ async function runTask(task, workerId) {
         await client.reportAccount({
           agent_id: cfg.agentId, account_id: deadId,
           ok: false, code: sessionruntime.LOGIN_REQUIRED_CODE,
+          // 🔴 登录态被踢自动停用（1015 用户定版）：aistudio 账号被 Google 踢
+          // 登录态/弹人机验证页时，带 sleep_until=+1h 回报 —— 号池停租 1 小时，
+          // 期间不再把它租出去接活（控制台仍可见）；到点自动恢复参战。
+          //（429 限流同闸已生效；这里把 cookie 失效也纳入同一停用纪律。）
+          ...(backend === 'aistudio_image'
+            ? { sleep_until: Math.floor(Date.now() / 1000) + 3600 }
+            : {}),
           message: String(err.message).slice(0, 300),
         });
       } catch (e2) { log(`[${workerId}] 失效标记回报失败：${e2.message}`, 'warn'); }
