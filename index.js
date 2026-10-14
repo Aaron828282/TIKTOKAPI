@@ -986,6 +986,58 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
     }
   };
   setInterval(() => { verifyWatch().catch(() => {}); }, 30_000).unref();
+
+  // 🔴 登录恢复探测（1015 用户定版）：验活失败（被 Google 踢登录）的账号不是
+  // 永死 —— 每 30 分钟对「休眠已到期/快到期」的失败号自动重登一次（错峰闸内）：
+  //   · 登录成功 → 回报 AISTUDIO_HEALTH + resume=true → 号池立即清休眠恢复接活；
+  //   · 仍失败   → 续命休眠 1 小时（失败原因落控制台验活列），下轮再试。
+  // 节奏刻意保守：真实登录对 Google 是敏感动作，宁慢勿狂；恢复成功前该号
+  // 始终被 sleep_until 闸挡在租约之外（不会边修边接活）。
+  const aiRecoveryRound = async () => {
+    let list = [];
+    try {
+      const r = await client.listAccounts('aistudio_image', true);
+      list = (r && r.accounts) || [];
+    } catch { return; }                    // 号池抖动：下轮再试
+    const nowS = Math.floor(Date.now() / 1000);
+    const dead = list.filter((a) => Number(a.verify_ok) === 0
+      && Number(a.sleep_until || 0) <= nowS + 300);
+    if (!dead.length) return;
+    log(`[watch] 登录恢复探测：${dead.map((a) => 'ai#' + a.id).join(',')} —— 逐号自动重登（错峰闸内）`);
+    for (const acc of dead) {
+      verifyChain = verifyChain.then(async () => {
+        try {
+          const acct = aistudioPool.get(acc.id, normalizeAiSession(acc.session || {}));
+          acct.authDead = null;            // 探测即给机会：先清死亡标记再试登录
+          await acct.ensure();
+          await client.reportAccount({
+            agent_id: cfg.agentId, account_id: acc.id, ok: true,
+            code: 'AISTUDIO_HEALTH', resume: true,
+            message: '登录恢复探测成功：登录态就绪 —— 恢复接活',
+          });
+          log(`[watch] ai#${acc.id} 登录恢复成功 —— 已回报号池立即恢复接活`);
+        } catch (err) {
+          const msg = String((err && err.message) || err).slice(0, 200);
+          try {
+            // 先记验活失败（控制台验活列更新），再续命休眠 1h（下轮再探）
+            await client.reportAccount({
+              agent_id: cfg.agentId, account_id: acc.id, ok: false,
+              code: (err && err.authExpired) ? '10001106' : 'AISTUDIO_VERIFY_FAIL',
+              message: `登录恢复探测失败：${msg}`,
+            });
+            await client.reportAccount({
+              agent_id: cfg.agentId, account_id: acc.id, ok: false,
+              code: '10001106', sleep_until: Math.floor(Date.now() / 1000) + 3600,
+              message: `登录恢复失败，继续停用 1 小时后自动重试：${msg}`,
+            });
+          } catch { /* 幂等 */ }
+          log(`[watch] ai#${acc.id} 登录恢复失败 —— 继续停用，1 小时后自动重试`, 'warn');
+        }
+      }).catch((e) => log(`[watch] 恢复探测内部异常：${e.message}`, 'warn'));
+    }
+  };
+  setInterval(() => { aiRecoveryRound().catch(() => {}); }, 30 * 60_000).unref();
+  setTimeout(() => { aiRecoveryRound().catch(() => {}); }, 2 * 60_000).unref();
 }
 
 // profile 残留对账（每 10 分钟）：控制台删了账号，磁盘 profile 也要跟着走。
