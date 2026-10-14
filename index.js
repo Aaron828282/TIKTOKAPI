@@ -968,12 +968,17 @@ if (cfg.gensparkEnabled || cfg.aistudioEnabled) {
       const now = new Map(list.map((a) => [Number(a.id), Number(a.version) || 0]));
       const first = !verifySeen.has(backend);
       const prev = verifySeen.get(backend) || new Map();
-      const fresh = list.filter((a) => prev.get(Number(a.id)) !== (Number(a.version) || 0));
+      // 🔴 首轮也要补验「从未验过」的号（1015 修复：verify_ok=-1）—— 节点
+      // 停机期间新加的账号，此前首轮只建目录会把它当老号永久跳过，控制台
+      // 「待验」挂死。首轮定向补验，之后仍只验版本变化。
+      const targets = first
+        ? list.filter((a) => Number(a.verify_ok) === -1)
+        : list.filter((a) => prev.get(Number(a.id)) !== (Number(a.version) || 0));
       verifySeen.set(backend, now);
-      if (first || !fresh.length) continue;  // 首轮建目录；无变化不打扰
-      const tag = `${backend === 'genspark_image' ? 'gs' : 'ai'}#${fresh.map((a) => a.id).join(',')}`;
-      log(`[watch] 检测到新账号/新凭据（${backend}）：${tag} —— 30s 内立即验证`);
-      for (const acc of fresh) {
+      if (!targets.length) continue;  // 无变化且无待验号，不打扰
+      const tag = `${backend === 'genspark_image' ? 'gs' : 'ai'}#${targets.map((a) => a.id).join(',')}`;
+      log(`[watch] ${first ? '启动补验待验账号' : '检测到新账号/新凭据'}（${backend}）：${tag} —— 立即验证`);
+      for (const acc of targets) {
         // 注意：/agent/accounts 不下发 status（服务端已只挑 active），别按 status 过滤。
         verifyChain = verifyChain.then(() => verifyNow(backend, acc))
           .catch((err) => log(`[watch] ${tag} 立即验证内部异常：${err.message}`, 'warn'));
@@ -1067,6 +1072,8 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
   const tabDeadline = Date.now() + 20 * 60 * 1000;
   let queuedLogged = false;
   while (!acct.hasFreeTab()) {
+    // 🔴 排队期间账号被判死（Google 踢登录）→ 立即快速失败走换号，不空耗队列
+    if (acct.authDead) throw acct._authDeadError();
     if (Date.now() > tabDeadline) {
       return failure.localFailure(failure.KIND.QUOTA,
         `生图通道繁忙：账号 #${accountId} 的 tab 持续占满（已排队 ${Math.round((Date.now() - (tabDeadline - 20 * 60 * 1000)) / 1000)}s），请稍后重试`);
@@ -1116,6 +1123,11 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
     // upstreamCode=10001106，runTask 的 failover 会认出并走换号路径。
     if (err.authExpired) {
       log(`  [ai#${accountId}] Google cookie 失效：${err.message}`, 'warn');
+      // 🔴 账号处决广播（1015 用户定版）：确认本账号被踢后，关闭它名下全部
+      // 窗口、让同账号其他在途任务立即快速失败 —— 各自马上走换号 failover，
+      // 不必再等各自的 600s 超时。控制台侧由下方 failover 的 reportAccount
+      // (+1h 停用) 同步知晓「该账号走不通了」。
+      try { acct.markAuthDead(String(err.message || err)); } catch { /* 幂等 */ }
     }
     throw err;
   } finally {
