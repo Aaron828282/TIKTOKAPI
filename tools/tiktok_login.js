@@ -53,6 +53,7 @@ const PROFILE = String(CFG.profile_dir || path.join('data', 'tt-profiles', Strin
 const HEADLESS = CFG.headless !== false;
 const SHOTS = path.join('/tmp', 'tt-login-' + (CFG.account_id || 'x'));
 const OTP_TOOL = path.join(__dirname, 'outlook_read.js');
+const PANEL_TOOL = path.join(__dirname, 'codepanel_fetch.js');
 const OTP_PROFILE_ROOT = path.join('data', 'mail-profiles');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -171,19 +172,13 @@ async function fillFirst(page, selectors, value, { timeout = 3000 } = {}) {
  * 发件人过滤交给接码器外的正则：TikTok 的码邮件标题带「TikTok」/「verify」，
  * 接码器抓的是收件箱里最近的 6 位码 —— 刚触发的登录是最新一封，天然正确。
  */
-function fetchOtpCode(log) {
+function runTool(script, args, budgetMs, log) {
   return new Promise((resolve) => {
-    const local = EMAIL.split('@')[0].toLowerCase();
-    const child = spawn(process.execPath, [
-      OTP_TOOL,
-      '--email', EMAIL,
-      '--password', EMAIL_PASS,
-      '--profile-dir', path.join(OTP_PROFILE_ROOT, local),
-    ], { cwd: process.cwd() });
+    const child = spawn(process.execPath, [script, ...args], { cwd: process.cwd() });
     let stdout = '';
     let done = false;
     const finish = (r) => { if (!done) { done = true; resolve(r); } };
-    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } finish(null); }, 900_000);  // 验证码投递延迟实测 7~10 分钟（2026-10-13 实锤），v2 扫描预算 ~12 分钟，放宽到 15 分钟兜底
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } finish(null); }, budgetMs);
     child.stdout.on('data', (c) => { stdout += c; });
     child.on('error', (e) => { log(`接码器启动失败：${e.message}`); finish(null); });
     child.on('close', () => {
@@ -193,14 +188,62 @@ function fetchOtpCode(log) {
         if (line.startsWith('{')) {
           try {
             const r = JSON.parse(line);
-            if (r.ok && r.code) return finish(r);
-            return finish({ error: r.error || r.stage || 'no-code' });
+            return finish(r);
           } catch { /* 不是这行 */ }
         }
       }
-      finish({ error: '接码器无输出' });
+      finish(null);
     });
   });
+}
+
+/**
+ * 三级接码链（2026-10-14 改造，背景：机房 IP 做微软网页密码登录几乎必触发
+ * 「验证身份」二次验证风控 —— #28 实锤）：
+ *
+ *   ① outlook_read.js --no-login —— 只查本机 profile 的已登录会话：
+ *      会话活着 → 原路直读收件箱（最快、零成本）；没会话立即返回 need-login，
+ *      **绝不**触碰微软登录页（不产生风控暴露）。
+ *   ② codepanel_fetch.js —— 接码平台 API（OAuth 令牌读信，绕开网页风控）。
+ *      退出码 1（平台已覆盖该邮箱但没取到新码）→ 如实报失败，不回落网页登录；
+ *      退出码 2（平台未配置/不可达/邮箱不在清单）→ 才走 ③。
+ *   ③ outlook_read.js 完整网页接码 —— 旧行为兜底（含微软密码登录状态机），
+ *      只服务「接码平台管不着」的邮箱；EMAIL_PASS 没配就直接失败。
+ */
+async function fetchOtpCode(log) {
+  const base = ['--email', EMAIL, '--password', EMAIL_PASS,
+    '--profile-dir', path.join(OTP_PROFILE_ROOT, EMAIL.split('@')[0].toLowerCase())];
+  const panelReady = !!(process.env.RH_CODEPANEL_URL
+    && process.env.RH_CODEPANEL_USER && process.env.RH_CODEPANEL_PASS);
+
+  // ① 本机已登录会话直读
+  const direct = await runTool(OTP_TOOL, [...base, '--no-login'], 300_000, log);
+  if (direct && direct.ok && direct.code) return direct;
+  const directNote = direct
+    ? (direct.error || direct.stage || 'no-code')
+    : '子进程超时';
+  log(`本机 Outlook 无已登录会话（${directNote}）` + (panelReady ? '，走接码平台 API…' : ''));
+
+  // ② 接码平台 API（OAuth 读信，绕开微软网页风控）
+  if (panelReady && fs.existsSync(PANEL_TOOL)) {
+    const panel = await runTool(PANEL_TOOL, ['--email', EMAIL], 330_000, log);
+    if (panel && panel.ok && panel.code) {
+      log(`接码平台取到码（age ${panel.age_seconds ?? '?'}s）`);
+      return panel;
+    }
+    if (!panel || panel._rc !== 2) {
+      // 平台已配置且该邮箱在授权清单里 —— 失败也别再碰微软网页登录
+      return { error: '接码失败：' + (panel ? (panel.error || panel.stage || 'no-code') : '子进程超时')
+        + '（该邮箱由接码平台接管，不回落网页登录防触发微软风控）' };
+    }
+    log(`接码平台不可用（${(panel && panel.error) || '未知'}），回落网页接码…`);
+  }
+
+  // ③ 旧路径兜底：完整网页接码（含密码登录）
+  if (!EMAIL_PASS) return { error: '无邮箱密码且接码平台不可用，无法接码' };
+  const web = await runTool(OTP_TOOL, base, 300_000, log);
+  if (web && web.ok && web.code) return web;
+  return { error: web ? (web.error || web.stage || 'no-code') : '子进程超时' };
 }
 
 // ---------------------------------------------------------------- 形状验证码求解
@@ -594,12 +637,13 @@ function sweepNativePopups(reason) {
         // ③ OTP 页也弹原生模态（2026-09-28 用户实测：邮箱验证码页出弹窗
         // 后什么都点不动）—— 先清扫再干活
         sweepNativePopups('OTP页');
-        if (!EMAIL_PASS) {
+        if (!EMAIL_PASS && !process.env.RH_CODEPANEL_URL) {
           // 有时登录只弹形状验证码、不弹邮箱验证码（2026-09-28 实测）——
-          // 所以邮箱密码是可选材料；但 OTP 真弹出来而没有它，只能明确失败。
+          // 所以邮箱密码是可选材料；OTP 真弹出来时：本机没会话可以走接码
+          // 平台（RH_CODEPANEL_URL 配了就值得一试），两者都没有才明确失败。
           await shot(page, 'otp-no-pass');
           OUT({ ok: false, stage: 'otp',
-            error: '弹出邮箱验证码但控制台未配置邮箱密码（接不了码）', _rc: 1 });
+            error: '弹出邮箱验证码但邮箱密码与接码平台均未配置（接不了码）', _rc: 1 });
         }
         // 先点「发送验证码」（如果页面要求手动触发）
         await clickFirst(page, [
@@ -613,7 +657,7 @@ function sweepNativePopups(reason) {
           OUT({ ok: false, stage: 'otp-stuck',
             error: '验证码页反复出现 —— 码被拒或触发了限频，需人工看一眼', _rc: 2 });
         }
-        log('需要邮箱验证码，调网页接码器…');
+        log('需要邮箱验证码，走三级接码链（本机会话 → 接码平台 → 网页兜底）…');
         await shot(page, 'otp-page');
         const otp = await fetchOtpCode(log);
         if (!otp || !otp.code) {
