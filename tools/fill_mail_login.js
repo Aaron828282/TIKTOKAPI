@@ -35,10 +35,28 @@ const emails = JSON.parse(fs.readFileSync(LIST_FILE, 'utf8'))
   console.log(`清单 ${emails.length} 个邮箱（自动填表版），并发 ${CONCURRENCY}`);
   const done = [], manual = [], failed = [];
 
-  async function fillAndSubmit(page, email, pass, log) {
-    // 1) 等登录页邮箱框（outlook.live.com 会 302 到 login.microsoftonline.com）
-    await page.waitForSelector('input[name="loginfmt"]', { timeout: 60_000 });
-    // 2) profile 里若留有旧账户瓦片（选择账户页），先点匹配的那个
+  async function findLoginPage(ctx) {
+    // outlook.live.com 会把微软登录页开在**新标签页**（2026-10-14 noVNC 截图实锤
+    // 「Microsoft Outlook Personal」+「Sign in to your account」双标签）——
+    // 必须遍历 ctx.pages() 找 login.* 域，不能只盯第一个 tab。
+    const t0 = Date.now();
+    while (Date.now() - t0 < 90_000) {
+      for (const p of ctx.pages()) {
+        if (/login\.(microsoftonline|live)\.com/.test(p.url())) {
+          try {
+            await p.waitForSelector('input[name="loginfmt"]', { timeout: 10_000 });
+            return p;
+          } catch { /* 该 login 页还没渲染出表单，继续等 */ }
+        }
+      }
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+    throw new Error('90s 内未出现微软登录表单（input[name=loginfmt]）');
+  }
+
+  async function fillAndSubmit(ctx, email, pass, log) {
+    const page = await findLoginPage(ctx);
+    // profile 里若留有旧账户瓦片（选择账户页），先点匹配的那个
     try {
       const tile = page.locator(`div[data-test-id="${email}"]`);
       if (await tile.count()) { await tile.first().click(); log('点击已有账户瓦片'); }
@@ -78,7 +96,7 @@ const emails = JSON.parse(fs.readFileSync(LIST_FILE, 'utf8'))
         await page.goto('https://outlook.live.com/').catch(() => {});
         let state = 'opened';
         try {
-          await fillAndSubmit(page, email, pass, log);
+          await fillAndSubmit(ctx, email, pass, log);
           state = 'submitted';
         } catch (e) {
           log(`自动填表中断（${String(e.message).slice(0, 90)}）—— 窗口保留，请人工处理`);
