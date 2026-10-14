@@ -2150,12 +2150,13 @@ async function runTask(task, workerId) {
   let account = null;                      // { id, label }
   let session = null;                      // 租约带来的账号会话
   let lease = false;
+  const leasedBad = [];                    // 凭据结构不对被退回的账号（换号重试 exclude）
   {
     const deadline = Date.now() + LEASE_WAIT_MS;
     while (!stopping) {
       let r = null;
       try {
-        r = await client.leaseSession({ backend, taskId: tid });
+        r = await client.leaseSession({ backend, taskId: tid, exclude: leasedBad });
       } catch (err) {
         // 404 = 号池镜像还是旧版（没有 lease 端点）→ 与「池子为空」同路：
         // 回落 legacy 全局会话。其余错误（网络抖动/5xx）与 claim 同策略，等一轮再试。
@@ -2173,12 +2174,20 @@ async function runTask(task, workerId) {
             ? normalizeAiSession(r.session)
             : normalizeSession(r.session);
         } catch (err) {
-          log(`[${workerId}] 租到的账号凭据结构不对（${err.message}）—— 放弃执行`, 'error');
-          await report(tid, failure.localFailure(failure.KIND.PARAM,
-            `账号 #${(r.account && r.account.id) || '?'} 的凭据结构不对：${err.message}`));
-          state.active.delete(tid);
-          state.presence = state.active.size ? 'busy' : 'idle';
-          return;
+          // 2026-10-14 用户口径：凭据结构不对（登录型账号还没造出第一份
+          // cookie，缺 cookie/csrftoken）**不再判死任务** —— 归还槽位、
+          // exclude 该号、继续租号循环换一个试。此前直接 PARAM 失败，
+          // #28 一单被无 cookie 的号白白烧掉（号池侧同期已加
+          // 「无 cookie 不派单」闸，这里是双保险）。
+          const badId = (r.account && r.account.id) || 0;
+          log(`[${workerId}] 租到的账号 #${badId} 凭据结构不对（${err.message}）`
+            + ' —— 归还槽位并换号重试', 'warn');
+          try {
+            await client.releaseSession({ taskId: tid, accountId: badId });
+          } catch { /* 幂等 */ }
+          if (badId && !leasedBad.includes(badId)) leasedBad.push(badId);
+          // eslint-disable-next-line no-continue
+          continue;
         }
         account = { id: r.account.id, label: r.account.label || '' };
         active.account = account.label || `#${account.id}`;
