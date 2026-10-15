@@ -1160,11 +1160,48 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
     beat('AGENT_RUNNING', 5).catch(() => {});
   }, 60 * 1000);
   if (hbTimer.unref) hbTimer.unref();
+  // 🔴 生图硬超时（2026-10-16 用户定版）：从 AGENT_RUNNING 起算，超过
+  // RH_AISTUDIO_HARD_TIMEOUT_S（默认 600s = 10 分钟）未出图 → 无论卡在
+  // 重登错峰还是 RPC 等待，任务一律判失败：强制关闭本账号全部生图窗口、
+  // 立即验活 —— 通过 = 账号继续接单（本次不计考核）；不通过 = markAuthDead
+  // 走休眠流程（每小时验活重试）。此前 600s 只罩「提交后等出图」，提交前的
+  // 重登错峰循环（单次 11-12 分钟）无总时长约束，任务可无限期挂「节点生成中」。
+  const hardMs = (Number(process.env.RH_AISTUDIO_HARD_TIMEOUT_S) || 600) * 1000;
+  let hardRej = null;
+  const hardTimer = setTimeout(() => {
+    const e = Object.assign(new Error(`生图硬超时（${hardMs / 1000}s 未出图）—— 任务判失败，`
+      + '关闭生图窗口并触发账号验活'), { hardTimeout: true });
+    log(`  [ai#${accountId}] 🔴 ${e.message}`, 'warn');
+    acct.forceCloseTabs('生图硬超时').catch(() => {});
+    if (hardRej) hardRej(e);
+  }, hardMs);
+  if (hardTimer.unref) hardTimer.unref();
   try {
     // cancel.promise 传进执行面：触发时立即关页，挂起的 RPC 等待随之 reject
     //（见 lib/aistudio.js _submitOnce）—— 生成期也能被自动中断。
-    images = await acct.generate({ prompt, imagePaths, aspect, resolution: imageRes, cancel: { promise: watch.promise } });
+    images = await Promise.race([
+      acct.generate({ prompt, imagePaths, aspect, resolution: imageRes, cancel: { promise: watch.promise } }),
+      new Promise((_, reject) => { hardRej = reject; }),
+    ]);
   } catch (err) {
+    // 🔴 硬超时分支（先于其他判断）：任务判失败 + 验活处置。
+    if (err && err.hardTimeout) {
+      let verdict = '';
+      try {
+        const lv = await acct.livenessCheck();
+        verdict = lv && lv.ok ? `通过（${lv.detail}）` : `未通过（${(lv && lv.detail) || '未知'}）`;
+      } catch (e2) {
+        verdict = `探测异常（${String((e2 && e2.message) || e2).slice(0, 80)}）`;
+      }
+      log(`  [ai#${accountId}] 验活结果：${verdict}`, 'warn');
+      if (!/通过/.test(verdict.split('（')[0])) {
+        // 验活失败 → 立即休眠：关闭名下全部窗口 + 每小时验活重试的休眠流程
+        try { acct.markAuthDead(`生图硬超时后验活未通过：${verdict}`); } catch { /* 幂等 */ }
+      }
+      // 验活通过 → 账号继续接单，本次不计入账号考核（不 markAuthDead、不计失败数）
+      return failure.localFailure(failure.KIND.UPSTREAM_ERROR,
+        `生图超过 ${hardMs / 1000}s 未出图，任务判失败（账号验活${verdict}）`);
+    }
     // 号池判死 → 不区分底层错误形态，统一回报 CANCELLED（号池已是终态，
     // 这条回报只会落 already_final，无副作用；价值在让节点日志可读）。
     if (watch.cancelled) {
@@ -1183,6 +1220,7 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
     }
     throw err;
   } finally {
+    clearTimeout(hardTimer);
     clearInterval(hbTimer);
     // 临时参考图无论成败都清掉：托管平台磁盘不可靠，别留垃圾
     if (imagePaths.length) {
