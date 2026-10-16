@@ -1186,15 +1186,18 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
   } catch (err) {
     // 🔴 硬超时分支（先于其他判断）：任务判失败 + 验活处置。
     if (err && err.hardTimeout) {
+      let lvOk = null;
       let verdict = '';
       try {
         const lv = await acct.livenessCheck();
-        verdict = lv && lv.ok ? `通过（${lv.detail}）` : `未通过（${(lv && lv.detail) || '未知'}）`;
+        lvOk = Boolean(lv && lv.ok);
+        verdict = lvOk ? `通过（${lv.detail}）` : `未通过（${(lv && lv.detail) || '未知'}）`;
       } catch (e2) {
         verdict = `探测异常（${String((e2 && e2.message) || e2).slice(0, 80)}）`;
       }
       log(`  [ai#${accountId}] 验活结果：${verdict}`, 'warn');
-      if (!/通过/.test(verdict.split('（')[0])) {
+      // 🔴 用布尔量判断，严禁字符串模糊匹配（「未通过」包含「通过」，1016 实锤）
+      if (lvOk === false) {
         // 验活失败 → 立即休眠：关闭名下全部窗口 + 每小时验活重试的休眠流程
         try { acct.markAuthDead(`生图硬超时后验活未通过：${verdict}`); } catch { /* 幂等 */ }
       }
