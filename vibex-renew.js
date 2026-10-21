@@ -61,8 +61,9 @@ function isTokenLine(s) {
 }
 
 async function main() {
+  const FORCE = process.argv.includes('--force') // 2026-10-21: 2.5 通道要求新鲜 token，强制续期绕过 96h 节流
   const remain = currentExpiresMs() - Date.now()
-  if (remain > FRESH_MS) {
+  if (!FORCE && remain > FRESH_MS) {
     emit('SKIP', `${Math.round(remain / 3600000)}h`)
     log(`token still fresh (${Math.round(remain / 3600000)}h left), skip`)
     return 0
@@ -93,7 +94,7 @@ async function main() {
     await page.screenshot({ path: shot('01-filled') })
     await page.locator('button:has-text("登录"), .login-btn, [class*="login"] button').last().click()
     await page.waitForTimeout(6000)
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 45; i++) {
       if (page.url().includes('console.vibex.cn')) break
       await page.waitForTimeout(1000)
     }
@@ -106,7 +107,7 @@ async function main() {
     log(`console session ok (jwt len=${rhToken.length})`)
     const sso = `https://console.vibex.cn/sandbox-sso?app_id=${APP_ID}&return_origin=${encodeURIComponent('https://seedance.apps.vibex.cn')}`
     await page.goto(sso, { waitUntil: 'domcontentloaded', timeout: 45000 })
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 45; i++) {
       if (page.url().includes('vibex-sandbox-token=')) break
       await page.waitForTimeout(1000)
     }

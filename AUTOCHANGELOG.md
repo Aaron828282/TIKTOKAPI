@@ -29,3 +29,16 @@
  vibex-renew.js            | 141 ++++++++++++++++++++++++++++++++++++++++++++++
  5 files changed, 183 insertions(+)
 ```
+
+## 2026-10-21 20:30:01 autopush @ srv2012249
+- 7 files changed
+```
+ .vibex-sandbox-token           |   4 +-
+ renew-debug/01-filled.png      | Bin 28057 -> 30842 bytes
+ renew-debug/03-no-fragment.png | Bin 0 -> 5293 bytes
+ vibex-apps-probe.js            |  69 +++++++++++++++++++++++++++++++
+ vibex-renew.js                 |   7 ++--
+ vibex-session-capture.js       |  71 ++++++++++++++++++++++++++++++++
+ vibex25-browser-test.js        |  91 +++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 237 insertions(+), 5 deletions(-)
+```
