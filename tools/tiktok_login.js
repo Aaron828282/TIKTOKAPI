@@ -54,6 +54,7 @@ const HEADLESS = CFG.headless !== false;
 const SHOTS = path.join('/tmp', 'tt-login-' + (CFG.account_id || 'x'));
 const OTP_TOOL = path.join(__dirname, 'outlook_read.js');
 const PANEL_TOOL = path.join(__dirname, 'codepanel_fetch.js');
+const MAILTM_TOOL = path.join(__dirname, 'mailtm_fetch.js');
 const OTP_PROFILE_ROOT = path.join('data', 'mail-profiles');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -202,6 +203,10 @@ function runTool(script, args, budgetMs, log) {
  * POST /api/fetch-code 主动驱动同步（单次 3~5s），且后台轮询已并行化，
  * 之前的「等一轮 6 分钟」根因已根治，故恢复平台通道为默认取码路径）：
  *
+ *   ⓪ mailtm_fetch.js —— mail.tm 专用通道（2026-10-22 接入）：邮箱域名命中
+ *      RH_MAILTM_DOMAINS（默认 goeschman.com）→ 邮箱由 mail.tm API 托管，
+ *      非微软邮箱，①②③全不适用，最先分流直取。退出码语义同 ②：1=没等到
+ *      码如实报失败不回落；2=配置缺失/不可达才继续原链。
  *   ① outlook_read.js --no-login —— 只查本机 profile 的已登录会话：
  *      会话活着 → 原路直读收件箱（最快、零风控）；没会话立即返回 need-login，
  *      **绝不**触碰微软登录页（不产生风控暴露）。
@@ -218,6 +223,34 @@ async function fetchOtpCode(log) {
     '--profile-dir', path.join(OTP_PROFILE_ROOT, EMAIL.split('@')[0].toLowerCase())];
   const panelReady = !!(process.env.RH_CODEPANEL_URL
     && process.env.RH_CODEPANEL_USER && process.env.RH_CODEPANEL_PASS);
+
+  // ⓪ mail.tm 专用通道（2026-10-22 接入）：邮箱域名命中 RH_MAILTM_DOMAINS
+  //    （默认 goeschman.com，逗号分隔可多个）→ 该邮箱由 mail.tm API 托管，
+  //    不是微软邮箱，Outlook 直读/网页接码链全部不适用，必须最先分流。
+  //    协议与接码平台一致：退出码 0=取到码；1=配置有效但没等到码（如实报
+  //    失败不回落）；2=配置缺失/不可达（才继续往下走原链）。
+  const mailtmDomains = (process.env.RH_MAILTM_DOMAINS || 'goeschman.com')
+    .split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
+  const emailDomain = (EMAIL.split('@')[1] || '').toLowerCase();
+  if (mailtmDomains.includes(emailDomain)) {
+    if (!EMAIL_PASS || !fs.existsSync(MAILTM_TOOL)) {
+      return { error: 'mail.tm 邮箱接码缺材料：'
+        + (EMAIL_PASS ? 'mailtm_fetch.js 工具缺失' : '控制台未配邮箱密码（mail.tm 账号密码）')
+        + '，请补齐后重试' };
+    }
+    const mt = await runTool(MAILTM_TOOL, ['--email', EMAIL, '--password', EMAIL_PASS],
+      330_000, log);
+    if (mt && mt.ok && mt.code) {
+      log(`mail.tm 取到码（age ${mt.age_seconds ?? '?'}s，${mt.tries ?? '?'} 次）`);
+      return mt;
+    }
+    if (!mt || mt._rc !== 2) {
+      // 邮箱确实归 mail.tm 托管 —— 失败也别去碰微软网页登录
+      return { error: 'mail.tm 接码失败：' + (mt ? (mt.error || mt.stage || 'no-code') : '子进程超时')
+        + '（该邮箱由 mail.tm 托管，不回落网页登录）' };
+    }
+    log(`mail.tm 通道不可用（${(mt && mt.error) || '未知'}），继续原接码链…`);
+  }
 
   // ① 本机已登录会话直读（绝不触碰微软登录页）
   const direct = await runTool(OTP_TOOL, [...base, '--no-login'], 300_000, log);
