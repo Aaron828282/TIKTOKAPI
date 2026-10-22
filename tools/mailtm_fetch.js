@@ -10,9 +10,9 @@
  *   POST {base}/token   {address, password} → {token}（JWT，24h）
  *   GET  {base}/messages?page=1 → 消息数组（裸数组或 hydra:member）
  *   GET  {base}/messages/{id}   → 详情（含 text 纯文本正文）
- * TikTok 商务中心验证码邮件特征：主题「验证帮助中心」，正文引导句
- * 「以下是你申请获取的验证码」后独立一行 6 位大写字母数字混合码（如 PCZ8QR），
- * 10 分钟有效 —— 抽取规则按此定（只收字母+数字混合、排除纯数字年份等）。
+ * TikTok 商务中心验证码邮件特征：主题「验证帮助中心 / Verification help」，
+ * 正文引导句（中/英模板，可能换行拆分）后独立一行 4~8 位大写字母数字码，
+ * 可为纯字母（CJPCJB）或混合（PCZ8QR），10 分钟有效 —— 抽取规则按此定。
  *
  * 用法（由 tiktok_login.js 在邮箱域名命中 RH_MAILTM_DOMAINS 时调用）：
  *   node mailtm_fetch.js --email <邮箱> --password <邮箱密码>
@@ -65,27 +65,35 @@ function ageSeconds(iso) {
   return Number.isFinite(t) ? Math.max(0, Math.round((Date.now() - t) / 1000)) : null;
 }
 
-/** 从纯文本正文抽验证码：验证码引导句之后、独立成行的 4~8 位字母数字混合 token。 */
+/** 从正文抽验证码：引导句之后、独立成行的 4~8 位大写字母数字 token。
+ * 2026-10-22 二修（#86 线上实测）：①验证码可能是**纯字母**（如 CJPCJB）——
+ * 引导句命中后放宽为任意大写字母数字组合；兜底扫描仍排除纯数字（防抓年份）
+ * 但放行纯字母。②英文模板引导句有换行拆分变体（"Here is the code you
+ * requested … Enter / this code on the login verification page."）——补齐
+ * here is the code / code you requested / login verification 三个变体。 */
 function extractCode(text) {
   if (!text) return null;
   const lines = String(text).split(/\r?\n/).map((s) => s.trim());
-  const isToken = (s) => /^[A-Z0-9]{4,8}$/.test(s)
-    && /[A-Z]/.test(s) && /[0-9]/.test(s);   // 必须字母数字混合，排除纯数字年份/数量
+  const isToken = (s, relaxed) => {
+    if (!/^[A-Z0-9]{4,8}$/.test(s)) return false;
+    if (relaxed) return true;                    // 引导句上下文：任意组合（含纯数字码）
+    return /[0-9]/.test(s) ? /[A-Z]/.test(s) : true;  // 兜底：纯数字排除，纯字母放行
+  };
   const leadIdx = [];
   lines.forEach((ln, i) => {
-    if (/验证码/.test(ln) || /verification code|enter this code|your code/i.test(ln)) leadIdx.push(i);
+    if (/验证码|verification code|enter this code|login verification|your code|here is the code|code you requested/i.test(ln)) leadIdx.push(i);
   });
-  const scanFrom = (start, end) => {
+  const scanFrom = (start, end, relaxed) => {
     for (let i = Math.max(0, start); i < Math.min(lines.length, end); i++) {
-      if (isToken(lines[i])) return lines[i];
+      if (isToken(lines[i], relaxed)) return lines[i];
     }
     return null;
   };
   for (const li of leadIdx) {
-    const hit = scanFrom(li + 1, li + 6);   // 引导句后 5 行内
+    const hit = scanFrom(li + 1, li + 6, true);   // 引导句后 5 行内（放宽模式）
     if (hit) return hit;
   }
-  return scanFrom(0, lines.length);         // 兜底：全文第一个独立 token
+  return scanFrom(0, lines.length, false);        // 兜底：全文第一个独立 token（严格模式）
 }
 
 (async () => {
