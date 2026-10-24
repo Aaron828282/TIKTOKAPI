@@ -1971,8 +1971,61 @@ async function ossDirectDeliver(bytes, taskId, { partIndex = 0, contentType = 'v
   return commit.output_url;
 }
 
+/**
+ * 七牛中转交付（2026-10-24）：节点把字节送到就近的七牛边缘（海外 ~2.6MB/s），
+ * 站点再从七牛拉回并写入 OSS（国内 ~1.7MB/s）。七牛只是运输带，资产仍落 OSS。
+ */
+async function qiniuDeliver(bytes, taskId, { partIndex = 0, contentType = 'video/mp4' } = {}) {
+  const base = new URL(cfg.mirrorUrl).origin
+  const headers = {
+    ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
+    'X-Relay-Task-Id': String(taskId),
+    ...(partIndex >= 1 ? { 'X-Relay-Part-Index': String(partIndex) } : {}),
+    'Content-Type': 'application/json',
+  }
+  const tokenRes = await fetch(base + '/api/relay/qiniu-token', {
+    method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(30000),
+  })
+  const tokenText = await tokenRes.text()
+  if (!tokenRes.ok) throw new Error('qiniu-token HTTP ' + tokenRes.status + '：' + tokenText.slice(0, 160))
+  const info = JSON.parse(tokenText)
+  if (!info.token || !info.key || !info.upload_host) throw new Error('qiniu-token 响应缺少字段')
+
+  log('  七牛中转：上传 ' + (bytes.length / 1048576).toFixed(2) + 'MB → ' + info.upload_host + ' …')
+  const form = new FormData()
+  form.append('token', info.token)
+  form.append('key', info.key)
+  form.append('file', new Blob([bytes], { type: contentType }), 'v.mp4')
+  const startedAt = Date.now()
+  const upRes = await fetch('https://' + info.upload_host + '/', {
+    method: 'POST', body: form, signal: AbortSignal.timeout(1800000),
+  })
+  const upText = await upRes.text()
+  if (!upRes.ok) throw new Error('qiniu upload HTTP ' + upRes.status + '：' + upText.slice(0, 160))
+  const upSeconds = (Date.now() - startedAt) / 1000
+  log('  七牛上传完成 ' + upSeconds.toFixed(1) + 's（' + (bytes.length / 1048576 / Math.max(upSeconds, 0.1)).toFixed(2) + 'MB/s）')
+
+  const trRes = await fetch(base + '/api/relay/qiniu-transfer', {
+    method: 'POST', headers, body: JSON.stringify({ key: info.key }), signal: AbortSignal.timeout(600000),
+  })
+  const trText = await trRes.text()
+  if (!trRes.ok) throw new Error('qiniu-transfer HTTP ' + trRes.status + '：' + trText.slice(0, 160))
+  const out = JSON.parse(trText)
+  if (!out.output_url) throw new Error('qiniu-transfer 响应缺少 output_url')
+  log('  七牛中转完成 → OSS（站点拉取 ' + ((out.bytes || bytes.length) / 1048576).toFixed(2) + 'MB）')
+  return out.output_url
+}
+
 async function mirror(bytes, filename, taskId = '', { partIndex = 0, contentType = 'video/mp4' } = {}) {
   const maxBytes = cfg.mirrorMaxMb * 1024 * 1024;
+  // 七牛中转优先（2026-10-24）：失败自动回退到下面的 OSS 直传/中转。
+  if (cfg.deliveryChannel === 'qiniu' && bytes.length >= cfg.qiniuMinMb * 1024 * 1024) {
+    try {
+      return await qiniuDeliver(bytes, taskId, { partIndex, contentType });
+    } catch (err) {
+      log('  七牛中转失败，回退 OSS：' + String(err.message || err).slice(0, 160));
+    }
+  }
   if (bytes.length > maxBytes) {
     // 就地失败比传一半被 413 打回好：前者错误信息完整，后者连日志都看不全
     throw new Error(`成片 ${(bytes.length / 1048576).toFixed(2)}MB 超过收件端上限 `
