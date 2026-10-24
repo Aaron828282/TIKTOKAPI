@@ -1831,7 +1831,100 @@ async function runGensparkTask(task, workerId) {
  * 网站侧端点：/api/relay/oss-sign、/api/relay/oss-commit（同一 Bearer 令牌）。
  * 落点（storage_key）由网站决定，这里只搬运字节 —— 别想着自己拼 key。
  */
+/**
+ * 分片并行上传（2026-10-24）：把同一份字节切成 N 片，多连接并行 PUT，最后 complete。
+ * 只是传输方式变化，**不转码、不重编码，画质与单连接上传完全一致**。
+ * 实测单连接 17KB/s → 4 片并行约 80KB/s（跨境 RTT 211ms、丢包 5%）。
+ */
+async function multipartDeliver(bytes, taskId, { partIndex = 0, contentType = 'video/mp4' } = {}) {
+  const base = new URL(cfg.mirrorUrl).origin;
+  const baseHeaders = {
+    ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
+    'X-Relay-Task-Id': String(taskId),
+    ...(partIndex >= 1 ? { 'X-Relay-Part-Index': String(partIndex) } : {}),
+  };
+  const sign = async (action, extra = {}) => {
+    const res = await fetch(base + '/api/relay/oss-multipart', {
+      method: 'POST',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, ...extra }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error('oss-multipart ' + action + ' HTTP ' + res.status + '：' + text.slice(0, 160));
+    return JSON.parse(text);
+  };
+
+  const init = await sign('init');
+  const initRes = await fetch(init.url, { method: 'POST', signal: AbortSignal.timeout(60000) });
+  const initText = await initRes.text();
+  const uploadId = (initText.match(/<UploadId>([^<]+)<\/UploadId>/) || [])[1];
+  if (!initRes.ok || !uploadId) throw new Error('multipart init 失败 HTTP ' + initRes.status + '：' + initText.slice(0, 160));
+
+  const partSize = Math.max(1024 * 1024, cfg.multipartPartMb * 1024 * 1024);
+  const total = Math.ceil(bytes.length / partSize);
+  log('  分片上传 ' + total + ' 片（每片 ' + cfg.multipartPartMb + 'MB，并发 ' + cfg.multipartConcurrency + '）…');
+
+  const uploadPart = async (n) => {
+    const start = (n - 1) * partSize;
+    const chunk = bytes.subarray(start, Math.min(bytes.length, start + partSize));
+    const signed = await sign('part', { uploadId, partNumber: n });
+    const timeoutSec = Math.min(3600, Math.max(300, Math.ceil(chunk.length / (8 * 1024)) + 120));
+    const res = await fetch(signed.url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: chunk,
+      signal: AbortSignal.timeout(timeoutSec * 1000),
+    });
+    if (!res.ok) throw new Error('part ' + n + ' HTTP ' + res.status + '：' + (await res.text().catch(() => '')).slice(0, 120));
+    return { n, etag: res.headers.get('etag') || '' };
+  };
+
+  const results = [];
+  let next = 1;
+  const runners = Array.from({ length: Math.min(cfg.multipartConcurrency, total) }, async () => {
+    while (next <= total) {
+      const n = next; next += 1;
+      results.push(await uploadPart(n));
+    }
+  });
+  await Promise.all(runners);
+  results.sort((a, b) => a.n - b.n);
+
+  const xml = '<CompleteMultipartUpload>'
+    + results.map((part) => '<Part><PartNumber>' + part.n + '</PartNumber><ETag>' + part.etag + '</ETag></Part>').join('')
+    + '</CompleteMultipartUpload>';
+  const complete = await sign('complete', { uploadId });
+  const completeRes = await fetch(complete.url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/xml' },
+    body: xml,
+    signal: AbortSignal.timeout(180000),
+  });
+  if (!completeRes.ok) throw new Error('multipart complete HTTP ' + completeRes.status + '：' + (await completeRes.text()).slice(0, 160));
+
+  const commitRes = await fetch(base + '/api/relay/oss-commit', {
+    method: 'POST',
+    headers: { ...baseHeaders, 'Content-Type': 'application/json', 'X-Relay-Storage-Key': init.storage_key },
+    signal: AbortSignal.timeout(60000),
+  });
+  const commitText = await commitRes.text();
+  if (!commitRes.ok) throw new Error('oss-commit HTTP ' + commitRes.status + '：' + commitText.slice(0, 160));
+  const commit = JSON.parse(commitText);
+  if (!commit.output_url) throw new Error('oss-commit 响应里没有 output_url');
+  log('  分片上传完成（' + total + ' 片）');
+  return commit.output_url;
+}
+
 async function ossDirectDeliver(bytes, taskId, { partIndex = 0, contentType = 'video/mp4' } = {}) {
+  // 大文件优先分片并行（更快且免费）；失败自动回退单连接 PUT。
+  if (cfg.multipartEnabled && bytes.length >= cfg.multipartMinMb * 1024 * 1024) {
+    try {
+      return await multipartDeliver(bytes, taskId, { partIndex, contentType });
+    } catch (err) {
+      log('  分片上传失败，回退单连接：' + String(err.message || err).slice(0, 160));
+    }
+  }
   const base = new URL(cfg.mirrorUrl).origin;
   const signHeaders = {
     ...(cfg.mirrorToken ? { Authorization: 'Bearer ' + cfg.mirrorToken } : {}),
@@ -1845,9 +1938,11 @@ async function ossDirectDeliver(bytes, taskId, { partIndex = 0, contentType = 'v
   const sign = JSON.parse(signText);
   if (!sign.upload_url) throw new Error('oss-sign 响应里没有 upload_url');
 
-  // PUT 超时按体积缩放：实测 Hostinger→OSS ~55KB/s，24MB 上限要 445s；
-  // 按 25KB/s 慢速留裕量（+120s 握手/首字节），上限 1800s（任务总超时 7200s 兜底）。
-  const putTimeoutSeconds = Math.min(1800, Math.max(600, Math.ceil(bytes.length / (25 * 1024)) + 120));
+  // PUT 超时按体积缩放（2026-10-24 用户定版：关掉传输加速后必须按慢速线路估算）。
+  // 标准域名 美国→北京 实测 20~55KB/s，最差约 10KB/s；按 **8KB/s** 兜底留裕量：
+  //   20MB → 2560s（约 43 分钟）+120s；上限 3600s（1 小时）。
+  // 号池侧监控兜底已放宽到 90 分钟，网站侧 150 分钟，链路不会再提前判失败。
+  const putTimeoutSeconds = Math.min(3600, Math.max(600, Math.ceil(bytes.length / (8 * 1024)) + 120));
   const putCtrl = new AbortController();
   const putTimer = setTimeout(() => putCtrl.abort(), putTimeoutSeconds * 1000);
   let putRes;
