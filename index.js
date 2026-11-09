@@ -1078,10 +1078,14 @@ async function executeAistudioInner(task, session, beat, { lease = false, accoun
             : 'AI Studio 生图必须走账号租约执行（号池账号池为空，未配置 Google 账号）');
   }
 
-  // 参考图：可选 0~4 张（0 张 = 纯文生图）。号池侧图片已在自家存储，
+  // 参考图：可选 0~9 张（0 张 = 纯文生图）。号池侧图片已在自家存储，
   // 节点逐张抓到临时文件，页面内用 setInputFiles 喂给上传控件。
-  // 上限 4 是 UI 契约（控制台已限制）；节点侧再截一道，防外部调用方绕过。
-  const refUrls = (task.image_urls || []).filter(Boolean).slice(0, 4);
+  // 🔴 2026-11-09 上限 4 → 9：Google 官方 Gemini 3 Pro Image 规格为「最多 14 张输入图，
+  // 走 HTTP/HTTPS URL 时 ≤10 张」。网站 effectiveMaxReferences 与开放 API refLimit
+  // 早已统一 9 张，节点这里的 4 是早期契约遗留，会导致「站点允许传 9 张、节点只吃 4 张」。
+  // 节点侧仍截一道，防外部调用方绕过。
+  const AISTUDIO_MAX_REFERENCES = 9;
+  const refUrls = (task.image_urls || []).filter(Boolean).slice(0, AISTUDIO_MAX_REFERENCES);
   const aspect = String(task.aspect_ratio || '').trim();
   // 生图分辨率档（1K/2K/4K）：网站按档计费（1K=9 / 4K=10 星点），空 = 节点默认 4K。
   const imageRes = String(task.image_resolution || '').trim().toUpperCase();
