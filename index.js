@@ -158,6 +158,9 @@ function json(res, code, obj) {
   res.end(body);
 }
 
+// 启动时明确告知 /status 是否受保护（避免 .env 丢失后静默变公开）
+console.log(`[status] token auth ${process.env.RHNODE_STATUS_TOKEN ? 'ENABLED' : 'DISABLED (public)'}`);
+
 const server = http.createServer((req, res) => {
   const path = (req.url || '/').split('?')[0];
 
@@ -168,6 +171,20 @@ const server = http.createServer((req, res) => {
   }
 
   if (path === '/status') {
+    // 可选鉴权（2026-11-25）：仅当配置 RHNODE_STATUS_TOKEN 时校验。
+    // 未配置即放行 —— 观测口不能因配置缺失而变瞎，探活/排障优先。
+    // 同时接受 ?token= 与 X-Status-Token 两种传法，避免调用方改造。
+    const requiredToken = String(process.env.RHNODE_STATUS_TOKEN || '').trim();
+    if (requiredToken) {
+      let supplied = String(req.headers['x-status-token'] || '').trim();
+      if (!supplied) {
+        try { supplied = String(new URL(req.url, 'http://127.0.0.1').searchParams.get('token') || '').trim(); } catch (e) {}
+      }
+      if (supplied !== requiredToken) {
+        json(res, 401, { ok: false, error: 'status_token_required' });
+        return;
+      }
+    }
     // 观测口绝不能 500（托管平台会把它当进程死了）。任何字段计算炸了都降级成
     // 200 + error 说明 —— 观测挂掉比观测缺一块更害人。
     try {
