@@ -16,3 +16,7 @@ __pycache__/
 data/
 *.bak*
 venv/
+
+# Credentials must never be tracked (2026-11-24 security fix)
+.vibex-renew.env
+.vibex-sandbox-token
